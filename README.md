@@ -35,6 +35,25 @@ Options:
 | **Format** | PNG (lossless) or JPEG quality 95/88 |
 | **Auto-rotate sideways photos** | Experimental: rotates landscape-oriented scans upright |
 | **Background tolerance** | 8–60 (default 20). Higher = more aggressive background removal |
+| **Pause per scan** | Step mode: pause before each scan to review the detected mask |
+
+### Reviewing and correcting masks
+
+Enable **Pause per scan** to stop before every scan: the detected mask is shown in red
+over the image, with one dashed, numbered box per detected picture (1, 2, ...) and a
+numbered preview of each picture in the panel on the right. Edits:
+
+- **Paint** / **Erase** with the brush for fine-tuning.
+- **Add rectangle** / **Remove rectangle** to fill or clear whole areas.
+- **Shape mask** to drag a picture's box or its edge/corner handles so the red covers
+  exactly that picture.
+- **Undo** / **Reset mask** to step back or start over.
+
+Then click **OK - split with this mask**. **Skip this scan** leaves the scan unsplit and
+moves on; **Cancel batch** stops the run.
+
+In automatic mode you can still click **Pause** at any time — the next scan then opens
+for the same review, and the batch continues automatically after you click OK.
 
 Output files are named `<scan name>_01.png`, `<scan name>_02.png`, ...
 

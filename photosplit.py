@@ -439,7 +439,7 @@ def _auto_upright(img):
     return img
 
 
-def split_scan(path, tol=16.0, rotate=False, maxdim=3200, inset_full=4.0):
+def analyze_scan(path, tol=16.0, maxdim=3200, inset_full=4.0):
     im = Image.open(path)
     im = ImageOps.exif_transpose(im)
     if im.mode != "RGB":
@@ -460,6 +460,14 @@ def split_scan(path, tol=16.0, rotate=False, maxdim=3200, inset_full=4.0):
     opened = mimg.filter(ImageFilter.MinFilter(5)).filter(ImageFilter.MaxFilter(5))
     mask = np.asarray(opened) > 127
     mask = _majority(mask)
+    return {"path": path, "im": im, "small": small, "scale": scale, "bg": bg,
+            "tol": tol, "inset_full": inset_full, "mask": mask}
+
+
+def extract_parts(st, mask=None, rotate=False):
+    im = st["im"]
+    if mask is None:
+        mask = st["mask"]
     lab = _label(mask)
     min_area = 0.003 * mask.size
     comps = []
@@ -485,18 +493,23 @@ def split_scan(path, tol=16.0, rotate=False, maxdim=3200, inset_full=4.0):
         for pm, px, py in subs:
             if pm.sum() >= min_area * 0.5:
                 parts.append((pm, px, py))
-    inv = 1.0 / scale
+    inv = 1.0 / st["scale"]
     out = []
     for part in parts:
-        img = _extract(im, part, inv, bg, tol, inset_full)
+        img = _extract(im, part, inv, st["bg"], st["tol"], st["inset_full"])
         if img is not None:
             out.append(_auto_upright(img) if rotate else img)
     return out
 
 
-def process_file(path, outdir, fmt, quality, tol, rotate):
-    imgs = split_scan(path, tol=tol, rotate=rotate)
-    stem = os.path.splitext(os.path.basename(path))[0]
+def split_scan(path, tol=16.0, rotate=False, maxdim=3200, inset_full=4.0):
+    st = analyze_scan(path, tol=tol, maxdim=maxdim, inset_full=inset_full)
+    return extract_parts(st, rotate=rotate)
+
+
+def process_state(st, mask, outdir, fmt, quality, rotate):
+    imgs = extract_parts(st, mask, rotate=rotate)
+    stem = os.path.splitext(os.path.basename(st["path"]))[0]
     written = []
     for i, img in enumerate(imgs, 1):
         name = "%s_%02d.%s" % (stem, i, "png" if fmt == "png" else "jpg")
@@ -509,6 +522,11 @@ def process_file(path, outdir, fmt, quality, tol, rotate):
     return written
 
 
+def process_file(path, outdir, fmt, quality, tol, rotate):
+    st = analyze_scan(path, tol=tol)
+    return process_state(st, st["mask"], outdir, fmt, quality, rotate)
+
+
 def open_folder(path):
     if sys.platform.startswith("win"):
         os.startfile(path)
@@ -516,6 +534,467 @@ def open_folder(path):
         subprocess.Popen(["open", path])
     else:
         subprocess.Popen(["xdg-open", path])
+
+
+def _label_components(m):
+    """Label 4-connected True regions of a boolean mask. Returns (labels, n)."""
+    h, w = m.shape
+    parent = []
+
+    def find(a):
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+
+    runs = []
+    prev = []
+    for y in range(h):
+        idx = np.flatnonzero(m[y])
+        if idx.size == 0:
+            prev = []
+            continue
+        brk = np.flatnonzero(np.diff(idx) > 1)
+        starts = np.r_[idx[0], idx[brk + 1]]
+        ends = np.r_[idx[brk], idx[-1]] + 1
+        cur = []
+        for s, e in zip(starts.tolist(), ends.tolist()):
+            rid = len(parent)
+            parent.append(rid)
+            runs.append((y, s, e, rid))
+            cur.append((s, e, rid))
+        for ps, pe, prid in prev:
+            for s, e, rid in cur:
+                if s < pe and ps < e:
+                    ra, rb = find(prid), find(rid)
+                    if ra != rb:
+                        parent[rb] = ra
+        prev = cur
+    lbl = np.zeros((h, w), np.int32)
+    ids = {}
+    for y, x0, x1, rid in runs:
+        r = find(rid)
+        if r not in ids:
+            ids[r] = len(ids) + 1
+        lbl[y, x0:x1] = ids[r]
+    return lbl, len(ids)
+
+
+def mask_editor(parent, st):
+    """Modal mask review dialog. Returns (action, mask) with action in {"ok", "skip", "cancel"}."""
+    import base64
+    import io
+    import tkinter as tk
+    from tkinter import ttk, messagebox
+
+    try:
+        from PIL import ImageTk
+    except ImportError:
+        ImageTk = None
+
+    small = st["small"]
+    w0, h0 = small.size
+    sw = max(320, parent.winfo_screenwidth() - 140)
+    sh = max(240, parent.winfo_screenheight() - 260)
+    dscale = min(sw / w0, sh / h0, 1.0)
+    dw, dh = max(1, int(w0 * dscale)), max(1, int(h0 * dscale))
+
+    base = np.asarray(small.resize((dw, dh), Image.BILINEAR), np.float32)
+    orig = st["mask"].copy()
+    mask = st["mask"].copy()
+    red = np.array([255.0, 48.0, 48.0], np.float32)
+
+    top = tk.Toplevel(parent)
+    top.title("Review mask - %s" % os.path.basename(st["path"]))
+    top.transient(parent)
+    res = {"action": "cancel", "mask": None}
+
+    tool = tk.StringVar(value="paint")
+    brush = tk.IntVar(value=16)
+    comps = []
+    lbl = {"a": None}
+    drag = {"i": None, "mode": None, "orig": None, "start": None,
+            "rect": None, "ghost": None}
+
+    photo = {"im": None}
+
+    def make_photo(img):
+        if ImageTk is not None:
+            return ImageTk.PhotoImage(img)
+        b = io.BytesIO()
+        img.save(b, "PNG", compress_level=1)
+        try:
+            return tk.PhotoImage(data=base64.b64encode(b.getvalue()))
+        except tk.TclError:
+            b = io.BytesIO()
+            img.save(b, "GIF")
+            return tk.PhotoImage(data=base64.b64encode(b.getvalue()))
+
+    def show(img):
+        photo["im"] = make_photo(img)
+
+    mid = ttk.Frame(top)
+    mid.pack(fill="both", expand=True)
+    canvas = tk.Canvas(mid, width=dw, height=dh, cursor="crosshair",
+                       highlightthickness=0)
+    canvas.pack(side="left", fill="both", expand=True, padx=(8, 4), pady=(8, 2))
+
+    tw = 150
+    side = tk.Canvas(mid, width=tw + 24, highlightthickness=0)
+    sb = ttk.Scrollbar(mid, orient="vertical", command=side.yview)
+    side.config(yscrollcommand=sb.set)
+    sb.pack(side="right", fill="y", pady=(8, 2))
+    side.pack(side="right", fill="y", pady=(8, 2))
+    thumbs = []
+
+    def set_cursor():
+        canvas.config(cursor="fleur" if tool.get() == "move" else "crosshair")
+        draw(compute=True)
+
+    rect_id = {"id": None}
+
+    def recompute_comps():
+        comps.clear()
+        lbl["a"] = None
+        if not mask.any():
+            return
+        L, n = _label_components(mask)
+        lbl["a"] = L
+        for k in range(1, n + 1):
+            ys, xs = np.nonzero(L == k)
+            comps.append({"root": k,
+                          "rect": [float(xs.min()) * dscale, float(ys.min()) * dscale,
+                                   float(xs.max() + 1) * dscale,
+                                   float(ys.max() + 1) * dscale]})
+
+    def update_previews():
+        side.delete("all")
+        thumbs.clear()
+        y = 6
+        for i, c in enumerate(comps):
+            xa = int(round(c["rect"][0] / dscale))
+            ya = int(round(c["rect"][1] / dscale))
+            xb = int(round(c["rect"][2] / dscale))
+            yb = int(round(c["rect"][3] / dscale))
+            pad = max(2, int(0.05 * max(xb - xa, yb - ya)))
+            crop = small.crop((max(0, xa - pad), max(0, ya - pad),
+                               min(w0, xb + pad), min(h0, yb + pad)))
+            th = max(1, int(round(tw * crop.height / crop.width)))
+            im = crop.resize((tw, th), Image.BILINEAR)
+            pi = make_photo(im)
+            thumbs.append(pi)
+            side.create_image(12, y, image=pi, anchor="nw")
+            side.create_text(tw + 12, y + th + 4, text=str(i + 1), anchor="n",
+                             fill="#22d3ee", font="TkDefaultFont 10 bold")
+            y += th + 26
+        side.config(scrollregion=(0, 0, tw + 24, max(y, 1)))
+
+    def draw(compute=False):
+        md = np.asarray(Image.fromarray(mask.astype(np.uint8) * 255)
+                        .resize((dw, dh), Image.BILINEAR)) > 100
+        out = base.copy()
+        out[md] = out[md] * 0.45 + red * 0.55
+        show(Image.fromarray(out.astype(np.uint8)))
+        canvas.delete("all")
+        canvas.create_image(0, 0, image=photo["im"], anchor="nw")
+        if compute:
+            recompute_comps()
+            update_previews()
+        for i, c in enumerate(comps):
+            r = c["rect"]
+            t = "c%d" % i
+            canvas.create_rectangle(*r, outline="#22d3ee", width=2,
+                                    dash=(5, 4), tags=t)
+            if r[1] >= 16:
+                canvas.create_text(r[0] + 2, r[1] - 3, text=str(i + 1),
+                                   anchor="sw", fill="#22d3ee",
+                                   font="TkDefaultFont 10 bold", tags=t)
+            else:
+                canvas.create_text(r[0] + 2, r[1] + 3, text=str(i + 1),
+                                   anchor="nw", fill="#22d3ee",
+                                   font="TkDefaultFont 10 bold", tags=t)
+            if tool.get() == "move":
+                for _, hx, hy in rect_handles(r):
+                    canvas.create_rectangle(hx - 4, hy - 4, hx + 4, hy + 4,
+                                            fill="#22d3ee", outline="", tags=t)
+
+    undo = []
+
+    def push_undo():
+        undo.append(mask.copy())
+        if len(undo) > 8:
+            undo.pop(0)
+
+    cur = {"x": 0, "y": 0, "down": False}
+    rstart = {"xy": None}
+
+    def mxy(x, y):
+        return (int(min(max(x / dscale, 0), w0 - 1)),
+                int(min(max(y / dscale, 0), h0 - 1)))
+
+    def rect_handles(r):
+        x0, y0, x1, y1 = r
+        return (("nw", x0, y0), ("n", (x0 + x1) / 2.0, y0), ("ne", x1, y0),
+                ("w", x0, (y0 + y1) / 2.0), ("e", x1, (y0 + y1) / 2.0),
+                ("sw", x0, y1), ("s", (x0 + x1) / 2.0, y1), ("se", x1, y1))
+
+    def handle_at(r, x, y):
+        for name, hx, hy in rect_handles(r):
+            if abs(x - hx) <= 5 and abs(y - hy) <= 5:
+                return name
+        return None
+
+    def hit_comp(x, y):
+        best = None
+        for i, c in enumerate(comps):
+            r = c["rect"]
+            h = handle_at(r, x, y)
+            if h is not None:
+                key = (0, (r[2] - r[0]) * (r[3] - r[1]))
+            elif r[0] <= x <= r[2] and r[1] <= y <= r[3]:
+                key = (1, (r[2] - r[0]) * (r[3] - r[1]))
+            else:
+                continue
+            if best is None or key < best[0]:
+                best = (key, i, h if h is not None else "move")
+        if best is None:
+            return None
+        return best[1], best[2]
+
+    def stamp(mx, my, val):
+        r = max(1, int(round(brush.get() / dscale)))
+        x0, x1 = max(0, mx - r), min(w0, mx + r + 1)
+        y0, y1 = max(0, my - r), min(h0, my + r + 1)
+        if x1 <= x0 or y1 <= y0:
+            return
+        yy, xx = np.ogrid[y0:y1, x0:x1]
+        mask[y0:y1, x0:x1][(yy - my) ** 2 + (xx - mx) ** 2 <= r * r] = val
+
+    def stroke(a, b, val):
+        n = max(abs(b[0] - a[0]), abs(b[1] - a[1]))
+        if n == 0:
+            stamp(a[0], a[1], val)
+            return
+        for t in range(n + 1):
+            stamp(int(round(a[0] + (b[0] - a[0]) * t / n)),
+                  int(round(a[1] + (b[1] - a[1]) * t / n)), val)
+
+    def painting():
+        return tool.get() in ("paint", "erase")
+
+    def on_press(ev):
+        if tool.get() == "move":
+            hit = hit_comp(ev.x, ev.y)
+            if hit is None:
+                return
+            i, m = hit
+            drag["i"] = i
+            drag["mode"] = m
+            drag["orig"] = list(comps[i]["rect"])
+            drag["start"] = (ev.x, ev.y)
+            canvas.itemconfigure("c%d" % i, state="hidden")
+            return
+        if painting():
+            push_undo()
+            cur["down"] = True
+            cur["x"], cur["y"] = ev.x, ev.y
+            stamp(*mxy(ev.x, ev.y), 1 if tool.get() == "paint" else 0)
+            draw()
+        else:
+            rstart["xy"] = (ev.x, ev.y)
+
+    def shape_rect(ev):
+        ox0, oy0, ox1, oy1 = drag["orig"]
+        m = drag["mode"]
+        if m == "move":
+            dx = min(max(ev.x - drag["start"][0], -ox0), dw - ox1)
+            dy = min(max(ev.y - drag["start"][1], -oy0), dh - oy1)
+            return [ox0 + dx, oy0 + dy, ox1 + dx, oy1 + dy]
+        sep = max(4.0, 2 * dscale)
+        r = [ox0, oy0, ox1, oy1]
+        if "w" in m:
+            r[0] = min(max(ev.x, 0), ox1 - sep)
+        if "e" in m:
+            r[2] = max(min(ev.x, dw), ox0 + sep)
+        if "n" in m:
+            r[1] = min(max(ev.y, 0), oy1 - sep)
+        if "s" in m:
+            r[3] = max(min(ev.y, dh), oy0 + sep)
+        return r
+
+    def update_ghost(r):
+        if drag["ghost"] is None:
+            items = [canvas.create_rectangle(*r, outline="#22d3ee", width=2,
+                                             tags="ghost")]
+            for _, hx, hy in rect_handles(r):
+                items.append(canvas.create_rectangle(hx - 4, hy - 4, hx + 4, hy + 4,
+                                                     fill="#22d3ee", outline="",
+                                                     tags="ghost"))
+            items.append(canvas.create_text(r[0] + 2, r[1], text=str(drag["i"] + 1),
+                                            anchor="sw", fill="#22d3ee",
+                                            font="TkDefaultFont 10 bold",
+                                            tags="ghost"))
+            drag["ghost"] = items
+            return
+        canvas.coords(drag["ghost"][0], *r)
+        for i, (_, hx, hy) in enumerate(rect_handles(r), 1):
+            canvas.coords(drag["ghost"][i], hx - 4, hy - 4, hx + 4, hy + 4)
+        canvas.coords(drag["ghost"][-1], r[0] + 2, r[1])
+
+    def on_drag(ev):
+        if tool.get() == "move":
+            if drag["start"] is None:
+                return
+            drag["rect"] = shape_rect(ev)
+            update_ghost(drag["rect"])
+            return
+        if painting():
+            if not cur["down"]:
+                return
+            stroke(mxy(cur["x"], cur["y"]), mxy(ev.x, ev.y),
+                   1 if tool.get() == "paint" else 0)
+            cur["x"], cur["y"] = ev.x, ev.y
+            draw()
+        elif rstart["xy"] is not None:
+            x0, y0 = rstart["xy"]
+            if rect_id["id"] is None:
+                rect_id["id"] = canvas.create_rectangle(x0, y0, ev.x, ev.y,
+                                                        outline="#22d3ee", width=2)
+            else:
+                canvas.coords(rect_id["id"], x0, y0, ev.x, ev.y)
+
+    def on_release(ev):
+        if tool.get() == "move":
+            if drag["start"] is None:
+                return
+            i, orig = drag["i"], drag["orig"]
+            drag["i"] = drag["mode"] = drag["orig"] = drag["start"] = None
+            if drag["ghost"] is not None:
+                canvas.delete("ghost")
+                drag["ghost"] = None
+            r = drag["rect"]
+            drag["rect"] = None
+            if r is None or r == orig:
+                draw(compute=True)
+                return
+            xa, xb = sorted((int(round(r[0] / dscale)), int(round(r[2] / dscale))))
+            ya, yb = sorted((int(round(r[1] / dscale)), int(round(r[3] / dscale))))
+            xa, xb = max(0, min(xa, w0)), max(0, min(xb, w0))
+            ya, yb = max(0, min(ya, h0)), max(0, min(yb, h0))
+            if xb - xa < 2 or yb - ya < 2:
+                draw(compute=True)
+                return
+            push_undo()
+            mask[lbl["a"] == comps[i]["root"]] = 0
+            mask[ya:yb, xa:xb] = 1
+            draw(compute=True)
+            return
+        if painting():
+            cur["down"] = False
+            draw(compute=True)
+            return
+        if rstart["xy"] is None:
+            return
+        x0, y0 = rstart["xy"]
+        rstart["xy"] = None
+        if rect_id["id"] is not None:
+            canvas.delete(rect_id["id"])
+            rect_id["id"] = None
+        ax, ay = mxy(x0, y0)
+        bx, by = mxy(ev.x, ev.y)
+        xa, xb = sorted((ax, bx))
+        ya, yb = sorted((ay, by))
+        if xb - xa < 2 or yb - ya < 2:
+            return
+        push_undo()
+        mask[ya:yb + 1, xa:xb + 1] = 1 if tool.get() == "rectadd" else 0
+        draw(compute=True)
+
+    canvas.bind("<ButtonPress-1>", on_press)
+    canvas.bind("<B1-Motion>", on_drag)
+    canvas.bind("<ButtonRelease-1>", on_release)
+
+    def undo_last():
+        if undo:
+            mask[:] = undo.pop()
+            draw(compute=True)
+
+    def reset():
+        push_undo()
+        mask[:] = orig
+        draw(compute=True)
+
+    bar = ttk.Frame(top, padding=(8, 2))
+    bar.pack(fill="x")
+    ttk.Radiobutton(bar, text="Paint", value="paint", variable=tool,
+                    command=set_cursor).pack(side="left")
+    ttk.Radiobutton(bar, text="Erase", value="erase", variable=tool,
+                    command=set_cursor).pack(side="left", padx=(6, 0))
+    ttk.Radiobutton(bar, text="Add rectangle", value="rectadd", variable=tool,
+                    command=set_cursor).pack(side="left", padx=(12, 0))
+    ttk.Radiobutton(bar, text="Remove rectangle", value="rectdel", variable=tool,
+                    command=set_cursor).pack(side="left", padx=(6, 0))
+    ttk.Radiobutton(bar, text="Shape mask", value="move", variable=tool,
+                    command=set_cursor).pack(side="left", padx=(12, 0))
+    ttk.Label(bar, text="Brush size:").pack(side="left", padx=(12, 2))
+    ttk.Spinbox(bar, from_=2, to=120, textvariable=brush, width=5).pack(side="left")
+    ttk.Button(bar, text="Undo", command=undo_last).pack(side="left", padx=(12, 0))
+    ttk.Button(bar, text="Reset mask", command=reset).pack(side="left", padx=(6, 0))
+
+    ttk.Label(top, text="Red = photo areas; one dashed numbered box per detected picture "
+                        "(previews on the right). Paint or erase with the brush, add/remove "
+                        "whole rectangles, or use Shape mask to drag each box and its "
+                        "edge/corner handles so the red covers exactly that picture. "
+                        "Click OK to split this scan with the mask shown.",
+              wraplength=max(320, dw), justify="left", padding=(8, 0)).pack(fill="x")
+
+    bot = ttk.Frame(top, padding=(8, 6))
+    bot.pack(fill="x")
+
+    def ok():
+        if not mask.any():
+            messagebox.showwarning("PhotoSplit", "The mask is empty. Paint or add a rectangle first, "
+                                                 "or use Skip to leave this scan unsplit.", parent=top)
+            return
+        res["action"] = "ok"
+        res["mask"] = mask.copy()
+        top.destroy()
+
+    def skip():
+        res["action"] = "skip"
+        top.destroy()
+
+    def cancel():
+        res["action"] = "cancel"
+        top.destroy()
+
+    ttk.Button(bot, text="Cancel batch", command=cancel).pack(side="right")
+    ttk.Button(bot, text="Skip this scan", command=skip).pack(side="right", padx=6)
+    ttk.Button(bot, text="OK - split with this mask", command=ok).pack(side="right", padx=6)
+
+    top.protocol("WM_DELETE_WINDOW", cancel)
+    top.bind("<Return>", lambda e: ok())
+    top.bind("<Escape>", lambda e: cancel())
+    set_cursor()
+    top.update_idletasks()
+    top.geometry("+%d+%d" % (max(0, parent.winfo_rootx() + (parent.winfo_width() - top.winfo_width()) // 2),
+                             max(0, parent.winfo_rooty() + 60)))
+
+    def grab(n=0):
+        if not top.winfo_exists():
+            return
+        try:
+            top.grab_set()
+        except tk.TclError:
+            if n < 40:
+                top.after(50, lambda: grab(n + 1))
+
+    grab()
+    try:
+        top.wait_window()
+    except tk.TclError:
+        pass
+    return res["action"], res["mask"]
 
 
 def collect_inputs(inputs):
@@ -601,11 +1080,16 @@ def run_gui():
     ttk.Label(opts, text="Background tolerance:").grid(row=3, column=0, sticky="w", pady=(6, 0))
     tol = tk.IntVar(value=20)
     ttk.Spinbox(opts, from_=8, to=60, textvariable=tol, width=6).grid(row=3, column=1, sticky="w", padx=6, pady=(6, 0))
+    step = tk.BooleanVar(value=False)
+    ttk.Checkbutton(opts, text="Pause per scan (review and correct each mask before splitting)",
+                    variable=step).grid(row=4, column=0, columnspan=3, sticky="w", pady=(6, 0))
 
     act = ttk.Frame(root, padding=8)
     act.pack(fill="x")
     b_go = ttk.Button(act, text="Split photos")
     b_go.pack(side="left")
+    b_pause = ttk.Button(act, text="Pause", state="disabled")
+    b_pause.pack(side="left", padx=(6, 0))
     pb = ttk.Progressbar(act, length=260, maximum=1)
     pb.pack(side="left", padx=10)
     b_open = ttk.Button(act, text="Open output folder", state="disabled")
@@ -616,7 +1100,11 @@ def run_gui():
         .pack(fill="x")
 
     q = queue.Queue()
-    busy = []
+    busy = [False]
+    pause_flag = threading.Event()
+    abort = threading.Event()
+    review = {"st": None, "result": None, "ev": threading.Event()}
+    flags = {"step": False, "tol": 20, "rot": False}
 
     def refresh():
         lb.delete(0, "end")
@@ -624,8 +1112,12 @@ def run_gui():
             lb.insert("end", f + ("   -> %d photos" % n if n is not None else ""))
 
     def set_busy(v):
+        busy[0] = v
         for b in (b_add, b_rem, b_clr, b_go, b_out):
             b.configure(state="disabled" if v else "normal")
+        b_pause.configure(state="normal" if v else "disabled", text="Pause")
+        if not v:
+            pause_flag.clear()
         if not v:
             b_open.configure(state="normal" if files and any(n is not None for _, n in files) else "disabled")
 
@@ -656,43 +1148,94 @@ def run_gui():
         if d:
             out_var.set(d)
 
-    def worker():
-        fmtmap = {"PNG (lossless)": ("png", None), "JPEG (quality 95)": ("jpeg", 95),
-                  "JPEG (quality 88)": ("jpeg", 88)}
-        f, qly = fmtmap[fmt.get()]
-        outdir = out_var.get() or os.path.join(os.path.dirname(files[0][0]), "split")
-        outdir = os.path.abspath(outdir)
-        try:
-            os.makedirs(outdir, exist_ok=True)
-        except OSError as e:
-            q.put(("done", 0, None, "Cannot create output folder: %s" % e))
-            return
+    def worker(f, qly, outdir):
         total = 0
         errs = []
+        cancelled = False
         for i, (path, _) in enumerate(list(files)):
+            if abort.is_set():
+                cancelled = True
+                break
+            name = os.path.basename(path)
             try:
-                written = process_file(path, outdir, f, qly or 95, int(tol.get()), bool(rot.get()))
+                st = analyze_scan(path, tol=flags["tol"])
+            except Exception as e:
+                errs.append("%s: %s" % (name, e))
+                q.put(("file", i, 0, None))
+                continue
+            mask = st["mask"]
+            if flags["step"] or pause_flag.is_set():
+                review["st"] = st
+                review["result"] = None
+                review["ev"].clear()
+                q.put(("review", i, name, None))
+                review["ev"].wait()
+                act, m = review["result"] or ("cancel", None)
+                review["st"] = None
+                pause_flag.clear()
+                if act == "skip":
+                    q.put(("status", "Skipped %s." % name))
+                    q.put(("file", i, 0, None))
+                    continue
+                if act == "cancel":
+                    cancelled = True
+                    q.put(("file", i, 0, None))
+                    break
+                mask = m
+            try:
+                q.put(("status", "Splitting %s..." % name))
+                written = process_state(st, mask, outdir, f, qly or 95, flags["rot"])
                 total += len(written)
                 q.put(("file", i, len(written), None))
             except Exception as e:
-                errs.append("%s: %s" % (os.path.basename(path), e))
+                errs.append("%s: %s" % (name, e))
                 q.put(("file", i, 0, None))
-        msg = "Done: %d photos saved to %s" % (total, outdir)
+        if cancelled:
+            msg = "Cancelled: %d photos saved to %s." % (total, outdir) if total else "Cancelled."
+        else:
+            msg = "Done: %d photos saved to %s" % (total, outdir)
         if errs:
             msg += "\nErrors: " + "; ".join(errs)
-        q.put(("done", total, outdir, msg))
+        q.put(("done", total, outdir if (total and not cancelled) else None, msg))
 
     def go():
         if not files:
             messagebox.showinfo("PhotoSplit", "Add some images first.")
             return
+        fmtmap = {"PNG (lossless)": ("png", None), "JPEG (quality 95)": ("jpeg", 95),
+                  "JPEG (quality 88)": ("jpeg", 88)}
+        f, qly = fmtmap[fmt.get()]
+        outdir = os.path.abspath(out_var.get() or os.path.join(os.path.dirname(files[0][0]), "split"))
+        try:
+            os.makedirs(outdir, exist_ok=True)
+        except OSError as e:
+            status_var.set("Cannot create output folder: %s" % e)
+            return
+        snap()
         set_busy(True)
+        abort.clear()
         status_var.set("Working...")
         pb.configure(maximum=len(files), value=0)
-        threading.Thread(target=worker, daemon=True).start()
+        threading.Thread(target=worker, args=(f, qly, outdir), daemon=True).start()
+
+    def toggle_pause():
+        if pause_flag.is_set():
+            pause_flag.clear()
+            b_pause.configure(text="Pause")
+            status_var.set("Resumed - continuing automatically.")
+        else:
+            pause_flag.set()
+            b_pause.configure(text="Resume")
+            status_var.set("Pause armed: the next scan will open for review.")
+
+    def snap():
+        flags["step"] = bool(step.get())
+        flags["tol"] = int(tol.get())
+        flags["rot"] = bool(rot.get())
 
     def poll():
         try:
+            snap()
             while True:
                 item = q.get_nowait()
                 if item[0] == "file":
@@ -700,6 +1243,16 @@ def run_gui():
                     files[i][1] = n
                     pb.configure(value=i + 1)
                     refresh()
+                elif item[0] == "status":
+                    status_var.set(item[1])
+                elif item[0] == "review":
+                    _, i, name, _ = item
+                    b_pause.configure(text="Pause")
+                    status_var.set("Reviewing %s - correct the mask, then click OK to split." % name)
+                    pb.configure(value=i)
+                    act, m = mask_editor(root, review["st"])
+                    review["result"] = (act, m)
+                    review["ev"].set()
                 elif item[0] == "done":
                     _, total, outdir, msg = item
                     status_var.set(msg)
@@ -712,12 +1265,24 @@ def run_gui():
             pass
         root.after(120, poll)
 
+    def on_close():
+        if busy[0]:
+            if not messagebox.askyesno("PhotoSplit", "A batch is running. Abort and quit?"):
+                return
+            abort.set()
+            if review["st"] is not None:
+                review["result"] = ("cancel", None)
+                review["ev"].set()
+        root.destroy()
+
     b_add.configure(command=add)
     b_rem.configure(command=rem)
     b_clr.configure(command=clr)
     b_out.configure(command=browse)
     b_go.configure(command=go)
+    b_pause.configure(command=toggle_pause)
     b_open.configure(command=lambda: open_folder(out_var.get() or "."))
+    root.protocol("WM_DELETE_WINDOW", on_close)
     poll()
     root.mainloop()
     return 0
