@@ -1,0 +1,14 @@
+# Personal scans and outputs - never commit these
+Scan_*
+split/
+__pycache__/
+*.pyc
+
+# Build artifacts (the exe ships as a GitHub release asset)
+PhotoSplit.exe
+build/
+dist/
+*.log
+
+# Legacy portable bundle
+PhotoSplit-windows-portable.zip
