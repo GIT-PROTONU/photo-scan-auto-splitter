@@ -311,6 +311,32 @@ def _watershed(m, ox, oy):
     return [((pm & m), ox, oy) for pm, _, _ in parts]
 
 
+_SEAM_SPAN_FRAC = 0.60
+_SEAM_EV_EDGE_FRAC = 0.12
+_MAX_PIECE_AR = 6.0
+_MIN_PIECE_FRAC = 0.05
+_QUAD_LOCK_FILL = 0.92
+_QUAD_LOCK_AREA = 0.25
+
+
+def _quad_lock(m, page_area):
+    """True when a component is geometrically a single photo: near-perfect
+    rectangular silhouette, 4 external corners, photo-like aspect ratio, and
+    too small to be a butted grid. Only ever fires where the depth-0 elong/area
+    gate would skip seam search anyway, so it can never block a real split."""
+    total = float(m.sum())
+    if total >= _QUAD_LOCK_AREA * page_area:
+        return False
+    nc = _ext_corners(m)
+    if not 4 <= nc <= 8:
+        return False
+    if total / float(m.size) < _QUAD_LOCK_FILL:
+        return False
+    bh, bw = m.shape
+    ar = max(bh, bw) / max(1.0, min(bh, bw))
+    return ar < 2.2
+
+
 def _find_seam(m, lum, lo=35.0):
     """Best near-horizontal seam line inside comp mask m (image coords aligned).
     Returns cut[x] row indices, or None."""
@@ -377,13 +403,16 @@ def _find_seam(m, lum, lo=35.0):
             break
     if cov < 0.68 * span or (c_hi - c_lo) < 0.7 * span:
         return None
+    ev_tol = max(4, int(round(_SEAM_EV_EDGE_FRAC * span)))
+    if c_lo > x0 + ev_tol or c_hi < x1 - ev_tol:
+        return None
     lo_y, hi_y = a + b * x0, a + b * x1
     lim = 0.06 * vext
     if not (y0 + lim <= min(lo_y, hi_y) and max(lo_y, hi_y) <= y1 - lim):
         return None
     cut = np.clip(np.round(a + b * np.arange(w, dtype=np.float64)), 0, h).astype(np.int32)
     xi = np.arange(x0, x1 + 1)
-    if m[cut[xi], xi].mean() < 0.6:
+    if m[cut[xi], xi].mean() < _SEAM_SPAN_FRAC:
         return None
     return cut
 
@@ -410,6 +439,103 @@ def _band_like(pa, pb, lc, axis):
     return float(np.median(lc[pa])) < 0.62 * float(np.median(lc[pb]))
 
 
+def _seg_dist(p, a, b):
+    ab = b - a
+    t = float(np.dot(p - a, ab)) / max(float(np.dot(ab, ab)), 1e-9)
+    t = min(1.0, max(0.0, t))
+    return float(math.hypot(*(p - (a + t * ab))))
+
+
+def _hull(pts):
+    p = pts[np.lexsort((pts[:, 1], pts[:, 0]))]
+
+    def half(q):
+        o = []
+        for pt in q:
+            while len(o) >= 2:
+                a, b = o[-2], o[-1]
+                if (b[0] - a[0]) * (pt[1] - a[1]) - (b[1] - a[1]) * (pt[0] - a[0]) <= 0:
+                    o.pop()
+                else:
+                    break
+            o.append(pt)
+        return o
+
+    hpts = half(p)[:-1] + half(p[::-1])[:-1]
+    if len(hpts) < 3:
+        return None
+    return np.array(hpts, np.float64)
+
+
+def _ext_corners(m, maxside=720.0):
+    """Harris corner count on the convex hull of a candidate piece mask."""
+    h, w = m.shape
+    if h < 24 or w < 24:
+        return 0
+    s = maxside / max(h, w)
+    if s < 1.0:
+        img = Image.fromarray(m.astype(np.uint8) * 255).resize(
+            (max(2, int(round(w * s))), max(2, int(round(h * s)))), Image.BILINEAR)
+        a = np.asarray(img, np.float32) / 255.0
+    else:
+        a = m.astype(np.float32)
+    hh, ww = a.shape
+    diag = math.hypot(hh, ww)
+    sm = max(2, int(round(0.004 * diag)))
+
+    def box(arr, rb):
+        ii = np.zeros((hh + 1, ww + 1), np.float64)
+        ii[1:, 1:] = arr.cumsum(0, dtype=np.float64).cumsum(1)
+        ya = np.minimum(np.arange(hh) + rb + 1, hh)
+        yb = np.maximum(np.arange(hh) - rb, 0)
+        xa = np.minimum(np.arange(ww) + rb + 1, ww)
+        xb = np.maximum(np.arange(ww) - rb, 0)
+        return ii[np.ix_(ya, xa)] - ii[np.ix_(yb, xa)] - ii[np.ix_(ya, xb)] + ii[np.ix_(yb, xb)]
+
+    a = box(a, sm) / float((2 * sm + 1) ** 2)
+    gx = np.zeros_like(a)
+    gy = np.zeros_like(a)
+    gx[:, 1:-1] = a[:, 2:] - a[:, :-2]
+    gy[1:-1, :] = a[2:, :] - a[:-2, :]
+    r = max(3, int(round(0.012 * diag)))
+    sxx, syy, sxy = box(gx * gx, r), box(gy * gy, r), box(gx * gy, r)
+    det = sxx * syy - sxy * sxy
+    tr = sxx + syy
+    disc = np.maximum(tr * tr - 4.0 * det, 0.0)
+    R = 0.5 * (tr - np.sqrt(disc))
+    top = float(R.max())
+    if top <= 0.0:
+        return 0
+    pk = 2
+    sw = sliding_window_view(np.pad(R, pk, constant_values=-1e30), (2 * pk + 1, 2 * pk + 1))
+    cand = (R >= 0.05 * top) & (R >= sw.max(axis=(2, 3)))
+    ys, xs = np.nonzero(cand)
+    if ys.size == 0:
+        return 0
+    o = np.argsort(R[ys, xs])[::-1][:200]
+    dmin2 = max(36.0, (0.045 * diag) ** 2)
+    pts = []
+    for i in o.tolist():
+        y, x = float(ys[i]), float(xs[i])
+        if all((y - q[0]) ** 2 + (x - q[1]) ** 2 >= dmin2 for q in pts):
+            pts.append((y, x))
+            if len(pts) >= 24:
+                break
+    bm = a >= 0.5
+    by, bx = np.nonzero(bm & ~_erode(bm))
+    hp = _hull(np.stack([bx, by], 1).astype(np.float64))
+    if hp is None or len(hp) < 4:
+        return 0
+    dtol = max(2.5, 0.02 * diag)
+    n = 0
+    for py, px in pts:
+        p = np.array([px, py])
+        d = min(_seg_dist(p, hp[i], hp[(i + 1) % len(hp)]) for i in range(len(hp)))
+        if d <= dtol:
+            n += 1
+    return n
+
+
 def _seam_split(m, ox, oy, lum, page_area, depth=0):
     total = float(m.sum())
     h, w = m.shape
@@ -419,6 +545,8 @@ def _seam_split(m, ox, oy, lum, page_area, depth=0):
     bh = int(ys.max()) - int(ys.min()) + 1
     bw = int(xs.max()) - int(xs.min()) + 1
     elong = max(bh, bw) / max(1.0, min(bh, bw))
+    if depth == 0 and _quad_lock(m, page_area):
+        return [(m, ox, oy)]
     if depth == 0 and elong < 2.2 and total < 0.25 * page_area:
         return [(m, ox, oy)]
     lc = lum[oy:oy + h, ox:ox + w]
@@ -455,8 +583,23 @@ def _seam_split(m, ox, oy, lum, page_area, depth=0):
             cs = _crop_sub(pm, px, py)
             if cs is None:
                 continue
-            out += _seam_split(cs[0], cs[1], cs[2], lum, page_area, depth + 1)
-        return out or [(m, ox, oy)]
+            nc = _ext_corners(cs[0])
+            fill = float(cs[0].sum()) / float(cs[0].size)
+            if not ((4 <= nc <= 10 and fill >= 0.80) or (nc < 4 and fill >= 0.90)):
+                out = None
+                break
+            bh, bw = cs[0].shape
+            ar = max(bh, bw) / max(1.0, min(bh, bw))
+            if ar > _MAX_PIECE_AR or float(cs[0].sum()) < max(400.0, _MIN_PIECE_FRAC * total):
+                out = None
+                break
+            out.append(cs)
+        if out is None:
+            continue
+        parts = []
+        for cm, cx, cy in out:
+            parts += _seam_split(cm, cx, cy, lum, page_area, depth + 1)
+        return parts or [(m, ox, oy)]
     return [(m, ox, oy)]
 
 
