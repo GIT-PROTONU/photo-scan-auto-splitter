@@ -89,7 +89,8 @@ Supported input formats: JPG/JPEG, PNG, TIFF, BMP, WebP.
 3. Regions that touch or overlap are separated with a geodesic distance-transform
    watershed seeded from distance-transform peaks.
 4. Each region's quadrilateral is refined against the full-resolution image and the
-   photo is perspective-transformed to a rectangle (deskewed).
+   photo is deskewed to the rectangle's angle and cropped (flatbed scans are flat,
+   so no perspective correction is applied — output is always orthographic).
 
 ## Running from source
 

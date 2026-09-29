@@ -8,6 +8,7 @@ import sys
 import threading
 
 import numpy as np
+from numpy.lib.stride_tricks import sliding_window_view
 from PIL import Image, ImageFilter, ImageOps
 
 Image.MAX_IMAGE_PIXELS = None
@@ -286,14 +287,176 @@ def _parts_from_assign(m, assign, k):
     return out
 
 
+def _fill_holes(m):
+    inv = ~m
+    if not inv.any():
+        return m.copy()
+    lab = _label(inv)
+    top = int(lab.max())
+    border = np.unique(np.concatenate([lab[0], lab[-1], lab[:, 0], lab[:, -1]]))
+    outside = np.zeros(top + 1, bool)
+    outside[border] = True
+    return m | (inv & ~outside[lab])
+
+
 def _watershed(m, ox, oy):
-    seeds = _dt_seeds(_dist_tf(m))
+    mf = _fill_holes(m)
+    seeds = _dt_seeds(_dist_tf(mf))
     if len(seeds) < 2:
         return []
-    parts = _geodesic_parts(m, seeds)
+    parts = _geodesic_parts(mf, seeds)
     if not parts:
-        parts = _voronoi_parts(m, seeds)
-    return [(pm, ox, oy) for pm, _, _ in parts]
+        parts = _voronoi_parts(mf, seeds)
+    return [((pm & m), ox, oy) for pm, _, _ in parts]
+
+
+def _find_seam(m, lum, lo=35.0):
+    """Best near-horizontal seam line inside comp mask m (image coords aligned).
+    Returns cut[x] row indices, or None."""
+    h, w = m.shape
+    ys, xs = np.nonzero(m)
+    if len(ys) == 0:
+        return None
+    x0, x1 = int(xs.min()), int(xs.max())
+    y0, y1 = int(ys.min()), int(ys.max())
+    span = x1 - x0 + 1
+    vext = y1 - y0 + 1
+    if span < 80 or vext < 90:
+        return None
+    g = np.zeros((h, w), np.float32)
+    if h > 5:
+        g[2:h - 2] = np.abs(lum[4:h] - lum[:h - 4])
+    mg = max(12, int(0.08 * vext))
+    ya, yb = y0 + mg, y1 - mg
+    if yb - ya < 40:
+        return None
+    win, half = 9, 4
+    pxs, pys = [], []
+    for x in range(x0, x1 + 1):
+        col = g[ya:yb + 1, x]
+        if col.size < win:
+            continue
+        sw = sliding_window_view(col, win)
+        mx = sw.max(axis=1)
+        c = col[half:half + sw.shape[0]]
+        for i in np.flatnonzero((c >= lo) & (c >= mx)):
+            pxs.append(x)
+            pys.append(i + ya + half)
+    if len(pxs) < 0.75 * span:
+        return None
+    pxs = np.asarray(pxs, np.float64)
+    pys = np.asarray(pys, np.float64)
+    edges = np.arange(ya - 8, yb + 9, 4.0)
+    best = None
+    for b in np.arange(-0.06, 0.061, 0.01):
+        hist, _ = np.histogram(pys - b * pxs, bins=edges)
+        sm = np.convolve(hist, np.ones(5, np.float64), "same")
+        i = int(np.argmax(sm))
+        a = 0.5 * (edges[i] + edges[i + 1])
+        dd = np.abs(pys - (a + b * pxs))
+        cols = np.unique(pxs[dd <= 9.0].astype(np.int64))
+        if best is None or len(cols) > best[0]:
+            best = (len(cols), b, a, cols.min(), cols.max())
+    cov, b, a, c_lo, c_hi = best
+    if cov < 0.68 * span or (c_hi - c_lo) < 0.7 * span:
+        return None
+    for _ in range(2):
+        d = np.abs(pys - (a + b * pxs))
+        inl = d <= 12.0
+        if inl.sum() < 0.6 * span:
+            break
+        A = np.stack([np.ones(int(inl.sum())), pxs[inl]], 1)
+        sol, *_ = np.linalg.lstsq(A, pys[inl], rcond=None)
+        na, nb = float(sol[0]), float(sol[1])
+        cols = np.unique(pxs[np.abs(pys - (na + nb * pxs)) <= 9.0].astype(np.int64))
+        nc = len(cols)
+        if nc >= cov:
+            a, b, cov, c_lo, c_hi = na, nb, nc, cols.min(), cols.max()
+        else:
+            break
+    if cov < 0.68 * span or (c_hi - c_lo) < 0.7 * span:
+        return None
+    lo_y, hi_y = a + b * x0, a + b * x1
+    lim = 0.06 * vext
+    if not (y0 + lim <= min(lo_y, hi_y) and max(lo_y, hi_y) <= y1 - lim):
+        return None
+    cut = np.clip(np.round(a + b * np.arange(w, dtype=np.float64)), 0, h).astype(np.int32)
+    xi = np.arange(x0, x1 + 1)
+    if m[cut[xi], xi].mean() < 0.6:
+        return None
+    return cut
+
+
+def _crop_sub(m, ox, oy):
+    ys, xs = np.nonzero(m)
+    if len(ys) == 0:
+        return None
+    y0, y1, x0, x1 = int(ys.min()), int(ys.max()), int(xs.min()), int(xs.max())
+    return m[y0:y1 + 1, x0:x1 + 1], ox + x0, oy + y0
+
+
+def _band_like(pa, pb, lc, axis):
+    if pa.sum() < 3000:
+        return False
+    if axis == 0:
+        ea = int(pa.any(axis=1).sum())
+        eb = int(pb.any(axis=1).sum())
+    else:
+        ea = int(pa.any(axis=0).sum())
+        eb = int(pb.any(axis=0).sum())
+    if ea >= 0.85 * eb:
+        return False
+    return float(np.median(lc[pa])) < 0.62 * float(np.median(lc[pb]))
+
+
+def _seam_split(m, ox, oy, lum, page_area, depth=0):
+    total = float(m.sum())
+    h, w = m.shape
+    if depth >= 5 or total < 4000.0 or h < 60 or w < 60:
+        return [(m, ox, oy)]
+    ys, xs = np.nonzero(m)
+    bh = int(ys.max()) - int(ys.min()) + 1
+    bw = int(xs.max()) - int(xs.min()) + 1
+    elong = max(bh, bw) / max(1.0, min(bh, bw))
+    if depth == 0 and elong < 2.2 and total < 0.25 * page_area:
+        return [(m, ox, oy)]
+    lc = lum[oy:oy + h, ox:ox + w]
+    for axis in (0, 1):
+        mm = m if axis == 0 else m.T
+        ll = lc if axis == 0 else lc.T
+        cut = _find_seam(np.ascontiguousarray(mm), np.ascontiguousarray(ll))
+        if cut is None:
+            continue
+        if axis == 0:
+            rr = np.arange(h)[:, None]
+            pa = m & (rr < cut[None, :])
+            pb = m & (rr >= cut[None, :])
+        else:
+            cc = np.arange(w)[None, :]
+            pa = m & (cc < cut[:, None])
+            pb = m & (cc >= cut[:, None])
+        sa, sb = float(pa.sum()), float(pb.sum())
+        need = max(0.15 * total, 400.0)
+        ba = _band_like(pa, pb, lc, axis)
+        bb = _band_like(pb, pa, lc, axis)
+        if min(sa, sb) < need:
+            ok = (sa < sb and ba and sb >= need) or (sb < sa and bb and sa >= need)
+            if not ok:
+                continue
+        if ba and not bb and sb > sa:
+            sides = ((pb, ox, oy),)
+        elif bb and not ba and sa > sb:
+            sides = ((pa, ox, oy),)
+        else:
+            sides = ((pa, ox, oy), (pb, ox, oy))
+        out = []
+        for pm, px, py in sides:
+            cs = _crop_sub(pm, px, py)
+            if cs is None:
+                continue
+            out += _seam_split(cs[0], cs[1], cs[2], lum, page_area, depth + 1)
+        return out or [(m, ox, oy)]
+    return [(m, ox, oy)]
 
 
 def _quad_corners(pts):
@@ -403,16 +566,27 @@ def _extract(full, part, inv_scale, bg, tol, inset_full):
     xs_work = wsc
     q[:, 0] = q[:, 0] / xs_work + fx0
     q[:, 1] = q[:, 1] / xs_work + fy0
-    wtop = math.hypot(*(q[1] - q[0]))
-    wbot = math.hypot(*(q[2] - q[3]))
-    hleft = math.hypot(*(q[3] - q[0]))
-    hright = math.hypot(*(q[2] - q[1]))
-    W = int(round(max(wtop, wbot)))
-    H = int(round(max(hleft, hright)))
-    if W < 100 or H < 100:
+    # Flatbed scans are flat: no perspective. Deskew to the fitted rectangle's
+    # angle (undoes placement rotation) and crop an axis-aligned rectangle.
+    a = math.atan2(q[1][1] - q[0][1], q[1][0] - q[0][0])
+    ca, sa = math.cos(a), math.sin(a)
+    cx = float(q[:, 0].mean())
+    cy = float(q[:, 1].mean())
+    rot = np.empty_like(q)
+    dx = q[:, 0] - cx
+    dy = q[:, 1] - cy
+    rot[:, 0] = cx + dx * ca + dy * sa
+    rot[:, 1] = cy - dx * sa + dy * ca
+    rx0 = max(0, int(math.floor(rot[:, 0].min())))
+    ry0 = max(0, int(math.floor(rot[:, 1].min())))
+    rx1 = min(full.width, int(math.ceil(rot[:, 0].max())))
+    ry1 = min(full.height, int(math.ceil(rot[:, 1].max())))
+    if rx1 - rx0 < 100 or ry1 - ry0 < 100:
         return None
-    data = tuple(v for p in (q[0], q[3], q[2], q[1]) for v in p)
-    return full.transform((W, H), Image.QUAD, data, Image.BICUBIC)
+    box = (rx0, ry0, rx1, ry1)
+    if abs(a) < 1e-4:
+        return full.crop(box)
+    return full.rotate(math.degrees(a), resample=Image.BICUBIC, center=(cx, cy)).crop(box)
 
 
 def _auto_upright(img):
@@ -486,13 +660,16 @@ def extract_parts(st, mask=None, rotate=False):
     parts = []
     page_area = float(mask.size)
     med = float(np.median([c[3] for c in comps])) if comps else 0.0
+    arr = np.asarray(st["small"], np.float32)
+    lum = arr @ np.array([0.299, 0.587, 0.114], np.float32)
     for cm, x0, y0, area in comps:
         subs = _split(cm, x0, y0)
         if len(subs) == 1 and area >= 0.04 * page_area and area > 1.15 * med:
             subs = _watershed(*subs[0]) or subs
         for pm, px, py in subs:
-            if pm.sum() >= min_area * 0.5:
-                parts.append((pm, px, py))
+            for qm, qx, qy in _seam_split(pm, px, py, lum, page_area):
+                if qm.sum() >= min_area * 0.5:
+                    parts.append((qm, qx, qy))
     inv = 1.0 / st["scale"]
     out = []
     for part in parts:
