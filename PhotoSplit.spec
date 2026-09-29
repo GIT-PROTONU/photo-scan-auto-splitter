@@ -1,5 +1,5 @@
 # -*- mode: python ; coding: utf-8 -*-
-# PyInstaller spec for Photo Scan Auto Splitter (v1.0 release build).
+# PyInstaller spec for Photo Scan Auto Splitter (release build).
 # Build with:  pyinstaller --noconfirm PhotoSplit.spec
 
 a = Analysis(

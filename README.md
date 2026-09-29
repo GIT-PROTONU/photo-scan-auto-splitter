@@ -11,9 +11,9 @@ people digitizing old photo albums, binder pages, or scanner beds with multiple 
 ## Download
 
 Grab the ready-to-run Windows executable from the
-[**v1.0 release page**](https://github.com/GIT-PROTONU/photo-scan-auto-splitter/releases/tag/v1.0):
+[**v1.2 release page**](https://github.com/GIT-PROTONU/photo-scan-auto-splitter/releases/tag/v1.2):
 
-- `PhotoScanAutoSplitter-1.0-Windows-x64.exe` — fully self-contained (Windows 10+, 64-bit).
+- `PhotoSplit.exe` — fully self-contained (Windows 10+, 64-bit).
   No Python, no installation: download, double-click, done.
 
 Or run from source with Python 3.8+ (see *Running from source* below).
@@ -36,6 +36,8 @@ Options:
 | **Auto-rotate sideways photos** | Experimental: rotates landscape-oriented scans upright |
 | **Background tolerance** | 8–60 (default 20). Higher = more aggressive background removal |
 | **Pause per scan** | Step mode: pause before each scan to review the detected mask |
+| **One subfolder per scan** | Writes each scan's photos into `<output folder>/<scan name>/` |
+| **Also copy the original scan** | Puts a copy of the original scan next to its extracted photos |
 
 ### Reviewing and correcting masks
 
@@ -56,6 +58,8 @@ In automatic mode you can still click **Pause** at any time — the next scan th
 for the same review, and the batch continues automatically after you click OK.
 
 Output files are named `<scan name>_01.png`, `<scan name>_02.png`, ...
+With **One subfolder per scan** they are grouped into one folder per scan
+(e.g. `split/Scan_001/Scan_001_01.png`).
 
 ### Command line
 

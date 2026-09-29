@@ -3,6 +3,7 @@ import argparse
 import math
 import os
 import queue
+import shutil
 import subprocess
 import sys
 import threading
@@ -1260,6 +1261,12 @@ def run_gui():
     step = tk.BooleanVar(value=False)
     ttk.Checkbutton(opts, text="Pause per scan (review and correct each mask before splitting)",
                     variable=step).grid(row=4, column=0, columnspan=3, sticky="w", pady=(6, 0))
+    sub = tk.BooleanVar(value=False)
+    ttk.Checkbutton(opts, text="One subfolder per scan", variable=sub)\
+        .grid(row=5, column=0, columnspan=3, sticky="w", pady=(6, 0))
+    orig = tk.BooleanVar(value=False)
+    ttk.Checkbutton(opts, text="Also copy the original scan", variable=orig)\
+        .grid(row=6, column=0, columnspan=3, sticky="w", pady=(6, 0))
 
     act = ttk.Frame(root, padding=8)
     act.pack(fill="x")
@@ -1281,7 +1288,7 @@ def run_gui():
     pause_flag = threading.Event()
     abort = threading.Event()
     review = {"st": None, "result": None, "ev": threading.Event()}
-    flags = {"step": False, "tol": 20, "rot": False}
+    flags = {"step": False, "tol": 20, "rot": False, "sub": False, "orig": False}
 
     def refresh():
         lb.delete(0, "end")
@@ -1361,7 +1368,13 @@ def run_gui():
                 mask = m
             try:
                 q.put(("status", "Splitting %s..." % name))
-                written = process_state(st, mask, outdir, f, qly or 95, flags["rot"])
+                destdir = outdir
+                if flags["sub"]:
+                    destdir = os.path.join(outdir, os.path.splitext(name)[0])
+                    os.makedirs(destdir, exist_ok=True)
+                written = process_state(st, mask, destdir, f, qly or 95, flags["rot"])
+                if flags["orig"]:
+                    shutil.copy2(path, os.path.join(destdir, name))
                 total += len(written)
                 q.put(("file", i, len(written), None))
             except Exception as e:
@@ -1409,6 +1422,8 @@ def run_gui():
         flags["step"] = bool(step.get())
         flags["tol"] = int(tol.get())
         flags["rot"] = bool(rot.get())
+        flags["sub"] = bool(sub.get())
+        flags["orig"] = bool(orig.get())
 
     def poll():
         try:
