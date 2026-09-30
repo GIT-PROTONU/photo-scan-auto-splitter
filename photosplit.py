@@ -17,7 +17,7 @@ Image.MAX_IMAGE_PIXELS = None
 EXTS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".webp"}
 
 APP_NAME = "photo-scan-auto-splitter"
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.5.0"
 
 
 def _runs(b):
@@ -204,6 +204,16 @@ def _dt_seeds(d, max_seeds=9):
                 return seeds
         if len(seeds) >= max_seeds:
             break
+    if len(seeds) > 1:
+        sorted_s = sorted(seeds, key=lambda s: -d[s[1], s[0]])
+        filtered = []
+        for s in sorted_s:
+            sx, sy = s
+            sd = d[sy, sx]
+            if any(math.hypot(sx - fx, sy - fy) < 0.75 * max(sd, d[fy, fx]) for fx, fy in filtered):
+                continue
+            filtered.append(s)
+        seeds = filtered
     return seeds
 
 
@@ -314,10 +324,10 @@ def _watershed(m, ox, oy):
     return [((pm & m), ox, oy) for pm, _, _ in parts]
 
 
-_SEAM_SPAN_FRAC = 0.60
+_SEAM_SPAN_FRAC = 0.10
 _SEAM_EV_EDGE_FRAC = 0.12
 _MAX_PIECE_AR = 6.0
-_MIN_PIECE_FRAC = 0.05
+_MIN_PIECE_FRAC = 0.01
 _QUAD_LOCK_FILL = 0.92
 _QUAD_LOCK_AREA = 0.25
 
@@ -426,6 +436,21 @@ def _crop_sub(m, ox, oy):
         return None
     y0, y1, x0, x1 = int(ys.min()), int(ys.max()), int(xs.min()), int(xs.max())
     return m[y0:y1 + 1, x0:x1 + 1], ox + x0, oy + y0
+
+
+def _crop_subs(m, ox, oy, page_area):
+    lab_m = _label(m)
+    res = []
+    for l in np.unique(lab_m):
+        if l == 0:
+            continue
+        ys, xs = np.nonzero(lab_m == l)
+        area = xs.size
+        if area < max(400, _MIN_PIECE_FRAC * page_area):
+            continue
+        sub_m = lab_m[ys.min():ys.max() + 1, xs.min():xs.max() + 1] == l
+        res.append((sub_m, ox + int(xs.min()), oy + int(ys.min())))
+    return res
 
 
 def _band_like(pa, pb, lc, axis):
@@ -548,15 +573,17 @@ def _seam_split(m, ox, oy, lum, page_area, depth=0):
     bh = int(ys.max()) - int(ys.min()) + 1
     bw = int(xs.max()) - int(xs.min()) + 1
     elong = max(bh, bw) / max(1.0, min(bh, bw))
-    if depth == 0 and _quad_lock(m, page_area):
+    if _quad_lock(m, page_area):
         return [(m, ox, oy)]
-    if depth == 0 and elong < 2.2 and total < 0.25 * page_area:
+    if elong < 2.2 and total < 0.25 * page_area:
         return [(m, ox, oy)]
     lc = lum[oy:oy + h, ox:ox + w]
     for axis in (0, 1):
         mm = m if axis == 0 else m.T
         ll = lc if axis == 0 else lc.T
-        cut = _find_seam(np.ascontiguousarray(mm), np.ascontiguousarray(ll))
+        cut = _find_seam(np.ascontiguousarray(mm), np.ascontiguousarray(ll), lo=35.0)
+        if cut is None:
+            cut = _find_seam(np.ascontiguousarray(mm), np.ascontiguousarray(ll), lo=25.0)
         if cut is None:
             continue
         if axis == 0:
@@ -583,29 +610,30 @@ def _seam_split(m, ox, oy, lum, page_area, depth=0):
             sides = ((pa, ox, oy), (pb, ox, oy))
         out = []
         for pm, px, py in sides:
-            cs = _crop_sub(pm, px, py)
-            if cs is None:
-                continue
-            nc = _ext_corners(cs[0])
-            fill = float(cs[0].sum()) / float(cs[0].size)
-            bh, bw = cs[0].shape
-            ar = max(bh, bw) / max(1.0, min(bh, bw))
-            if not ((4 <= nc <= 10 and fill >= 0.80) or (nc < 4 and fill >= 0.90)):
-                # A low-fill side with photo-like corner count is usually a
-                # still-butted multi-photo composite (e.g. half of a 2x2 grid
-                # whose own pair still has an internal gap). Recurse instead of
-                # rejecting the whole cut; the depth cap bounds recursion and
-                # the pre-extract sanity gate drops composites that refuse to
-                # sub-split.
-                if nc <= 10 and ar <= _MAX_PIECE_AR:
-                    out += _seam_split(cs[0], cs[1], cs[2], lum, page_area, depth + 1)
-                    continue
-                out = None
+            cs_list = _crop_subs(pm, px, py, page_area)
+            for cs in cs_list:
+                nc = _ext_corners(cs[0])
+                fill = float(cs[0].sum()) / float(cs[0].size)
+                bh, bw = cs[0].shape
+                ar = max(bh, bw) / max(1.0, min(bh, bw))
+                if not ((4 <= nc <= 10 and fill >= 0.80) or (nc < 4 and fill >= 0.90)):
+                    # A low-fill side with photo-like corner count is usually a
+                    # still-butted multi-photo composite (e.g. half of a 2x2 grid
+                    # whose own pair still has an internal gap). Recurse instead of
+                    # rejecting the whole cut; the depth cap bounds recursion and
+                    # the pre-extract sanity gate drops composites that refuse to
+                    # sub-split.
+                    if nc <= 14 and ar <= _MAX_PIECE_AR:
+                        out += _seam_split(cs[0], cs[1], cs[2], lum, page_area, depth + 1)
+                        continue
+                    out = None
+                    break
+                if ar > _MAX_PIECE_AR or float(cs[0].sum()) < max(400.0, _MIN_PIECE_FRAC * total):
+                    out = None
+                    break
+                out.append(cs)
+            if out is None:
                 break
-            if ar > _MAX_PIECE_AR or float(cs[0].sum()) < max(400.0, _MIN_PIECE_FRAC * total):
-                out = None
-                break
-            out.append(cs)
         if out is None:
             continue
         parts = []
@@ -797,7 +825,9 @@ def analyze_scan(path, tol=16.0, maxdim=3200, inset_full=4.0):
     bg = np.median(ring, axis=0)
     dist = np.sqrt(((arr - bg) ** 2).sum(axis=2))
     mimg = Image.fromarray((dist > tol).astype(np.uint8) * 255)
-    opened = mimg.filter(ImageFilter.MinFilter(5)).filter(ImageFilter.MaxFilter(5))
+    padded = ImageOps.expand(mimg, border=4, fill=0)
+    opened = padded.filter(ImageFilter.MinFilter(5)).filter(ImageFilter.MaxFilter(5))
+    opened = ImageOps.crop(opened, border=4)
     mask = np.asarray(opened) > 127
     mask = _majority(mask)
     return {"path": path, "im": im, "small": small, "scale": scale, "bg": bg,
@@ -840,31 +870,33 @@ def _dedupe_parts(parts, page_area, frac=0.5):
             continue
         cand = np.zeros((int(ys.max() - ys.min()) + 1, int(xs.max() - xs.min()) + 1), bool)
         cand[ys - ys.min(), xs - xs.min()] = True
+        cx = qx + int(xs.min())
+        cy = qy + int(ys.min())
         overlap = 0
         if kept_union is not None:
-            ox0 = max(qx, kept_union[1])
-            oy0 = max(qy, kept_union[2])
-            ox1 = min(qx + cand.shape[1], kept_union[1] + kept_union[0].shape[1])
-            oy1 = min(qy + cand.shape[0], kept_union[2] + kept_union[0].shape[0])
+            ox0 = max(cx, kept_union[1])
+            oy0 = max(cy, kept_union[2])
+            ox1 = min(cx + cand.shape[1], kept_union[1] + kept_union[0].shape[1])
+            oy1 = min(cy + cand.shape[0], kept_union[2] + kept_union[0].shape[0])
             if ox1 > ox0 and oy1 > oy0:
                 ov = kept_union[0][oy0 - kept_union[2]:oy1 - kept_union[2],
                                    ox0 - kept_union[1]:ox1 - kept_union[1]]
-                cc = cand[oy0 - qy:oy1 - qy, ox0 - qx:ox1 - qx]
+                cc = cand[oy0 - cy:oy1 - cy, ox0 - cx:ox1 - cx]
                 overlap = int((ov & cc).sum())
         if overlap > frac * float(qm.sum()):
             continue
         kept.append((qm, qx, qy))
         if kept_union is None:
-            kept_union = [cand.copy(), qx, qy]
+            kept_union = [cand.copy(), cx, cy]
         else:
             # widen union canvas
-            ux0, uy0 = min(qx, kept_union[1]), min(qy, kept_union[2])
-            ux1 = max(qx + cand.shape[1], kept_union[1] + kept_union[0].shape[1])
-            uy1 = max(qy + cand.shape[0], kept_union[2] + kept_union[0].shape[0])
+            ux0, uy0 = min(cx, kept_union[1]), min(cy, kept_union[2])
+            ux1 = max(cx + cand.shape[1], kept_union[1] + kept_union[0].shape[1])
+            uy1 = max(cy + cand.shape[0], kept_union[2] + kept_union[0].shape[0])
             nu = np.zeros((uy1 - uy0, ux1 - ux0), bool)
             nu[kept_union[2] - uy0:kept_union[2] - uy0 + kept_union[0].shape[0],
                kept_union[1] - ux0:kept_union[1] - ux0 + kept_union[0].shape[1]] |= kept_union[0]
-            nu[qy - uy0:qy - uy0 + cand.shape[0], qx - ux0:qx - ux0 + cand.shape[1]] |= cand
+            nu[cy - uy0:cy - uy0 + cand.shape[0], cx - ux0:cx - ux0 + cand.shape[1]] |= cand
             kept_union = [nu, ux0, uy0]
     return kept
 

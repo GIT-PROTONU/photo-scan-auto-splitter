@@ -11,7 +11,7 @@ people digitizing old photo albums, binder pages, or scanner beds with multiple 
 ## Download
 
 Grab the ready-to-run Windows executable from the
-[**v1.3 release page**](https://github.com/GIT-PROTONU/photo-scan-auto-splitter/releases/tag/v1.3):
+[**v1.5 release page**](https://github.com/GIT-PROTONU/photo-scan-auto-splitter/releases/tag/v1.5):
 
 - `PhotoSplit.exe` — fully self-contained (Windows 10+, 64-bit).
   No Python, no installation: download, double-click, done.
@@ -92,10 +92,13 @@ Supported input formats: JPG/JPEG, PNG, TIFF, BMP, WebP.
 2. Cleans the mask (morphological open + majority filter) and labels connected regions.
 3. Regions that touch or overlap are separated with a geodesic distance-transform
    watershed seeded from distance-transform peaks. Photos butted edge-to-edge with no
-   background gap are cut apart by a seam detector that only accepts near-axis-parallel
-   seam lines whose evidence runs boundary-to-boundary across the region, so internal
-   picture content (horizons, roof lines) is never mistaken for a seam; every resulting
-   piece must also pass corner-count, fill, aspect-ratio and area sanity bounds.
+   background gap (2x2 grids, photobooth strips) are cut apart by a seam detector that
+   only accepts near-axis-parallel seam lines whose gradient evidence runs
+   boundary-to-boundary across the region, so internal picture content (horizons, roof
+   lines) is never mistaken for a seam — even when the photos only touch across part of
+   the seam and a white gap runs along the rest of it. Every resulting piece must pass
+   corner-count, fill, aspect-ratio and area sanity bounds, so small prints (passport
+   photos, photobooth frames) are kept while slivers and scanner-edge lines are dropped.
 4. Each region's quadrilateral is refined against the full-resolution image and the
    photo is deskewed to the rectangle's angle and cropped (flatbed scans are flat,
    so no perspective correction is applied — output is always orthographic).
