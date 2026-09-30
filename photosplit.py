@@ -17,7 +17,7 @@ Image.MAX_IMAGE_PIXELS = None
 EXTS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".webp"}
 
 APP_NAME = "photo-scan-auto-splitter"
-APP_VERSION = "1.5.0"
+APP_VERSION = "1.6.0"
 
 
 def _runs(b):
@@ -329,7 +329,13 @@ _SEAM_EV_EDGE_FRAC = 0.12
 _MAX_PIECE_AR = 6.0
 _MIN_PIECE_FRAC = 0.01
 _QUAD_LOCK_FILL = 0.92
-_QUAD_LOCK_AREA = 0.25
+_QUAD_LOCK_AREA = 0.33
+# Real flatbed placement tilt is <~2.5 deg, but a genuinely tilted single print
+# can reach ~5 deg and should still be deskewed. Fitted quad angles beyond this
+# are silhouette-fit artifacts (ragged / white-merged masks), never a true
+# rotation, so the piece is cropped axis-aligned instead of being spuriously
+# deskewed (which tilted it and clipped its corners).
+_MAX_DESKEW_DEG = 6.0
 
 
 def _quad_lock(m, page_area):
@@ -713,6 +719,21 @@ def _refine(pts, q, inset):
     return q
 
 
+def _axis_crop(full, up, wsc, fx0, fy0, fx1, fy1, pts):
+    """Group-5 fallback: a piece whose fitted quad angle was rejected as a
+    silhouette artifact is cropped as a plain axis-aligned rectangle of its own
+    mask extent. Never rotates (which is what produced tilted crops with white
+    corner triangles and clipped content) and never masks by the ragged mask
+    (which punched holes into photos that contain large white regions)."""
+    bx0 = int(max(0, math.floor(pts[:, 0].min() / wsc)) + fx0)
+    by0 = int(max(0, math.floor(pts[:, 1].min() / wsc)) + fy0)
+    bx1 = int(min(full.width, math.ceil(pts[:, 0].max() / wsc)) + fx0)
+    by1 = int(min(full.height, math.ceil(pts[:, 1].max() / wsc)) + fy0)
+    if bx1 - bx0 < 100 or by1 - by0 < 100:
+        return None
+    return full.crop((bx0, by0, bx1, by1))
+
+
 def _extract(full, part, inv_scale, bg, tol, inset_full):
     m, ox, oy = part
     ys, xs = np.nonzero(m)
@@ -753,6 +774,8 @@ def _extract(full, part, inv_scale, bg, tol, inset_full):
     # Flatbed scans are flat: no perspective. Deskew to the fitted rectangle's
     # angle (undoes placement rotation) and crop an axis-aligned rectangle.
     a = math.atan2(q[1][1] - q[0][1], q[1][0] - q[0][0])
+    if abs(math.degrees(a)) > _MAX_DESKEW_DEG:
+        return _axis_crop(full, up, wsc, fx0, fy0, fx1, fy1, pts)
     ca, sa = math.cos(a), math.sin(a)
     cx = float(q[:, 0].mean())
     cy = float(q[:, 1].mean())
