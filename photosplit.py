@@ -10,11 +10,14 @@ import threading
 
 import numpy as np
 from numpy.lib.stride_tricks import sliding_window_view
-from PIL import Image, ImageFilter, ImageOps
+from PIL import Image, ImageDraw, ImageFilter, ImageOps
 
 Image.MAX_IMAGE_PIXELS = None
 
 EXTS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".webp"}
+
+APP_NAME = "photo-scan-auto-splitter"
+APP_VERSION = "1.4.0"
 
 
 def _runs(b):
@@ -585,11 +588,20 @@ def _seam_split(m, ox, oy, lum, page_area, depth=0):
                 continue
             nc = _ext_corners(cs[0])
             fill = float(cs[0].sum()) / float(cs[0].size)
-            if not ((4 <= nc <= 10 and fill >= 0.80) or (nc < 4 and fill >= 0.90)):
-                out = None
-                break
             bh, bw = cs[0].shape
             ar = max(bh, bw) / max(1.0, min(bh, bw))
+            if not ((4 <= nc <= 10 and fill >= 0.80) or (nc < 4 and fill >= 0.90)):
+                # A low-fill side with photo-like corner count is usually a
+                # still-butted multi-photo composite (e.g. half of a 2x2 grid
+                # whose own pair still has an internal gap). Recurse instead of
+                # rejecting the whole cut; the depth cap bounds recursion and
+                # the pre-extract sanity gate drops composites that refuse to
+                # sub-split.
+                if nc <= 10 and ar <= _MAX_PIECE_AR:
+                    out += _seam_split(cs[0], cs[1], cs[2], lum, page_area, depth + 1)
+                    continue
+                out = None
+                break
             if ar > _MAX_PIECE_AR or float(cs[0].sum()) < max(400.0, _MIN_PIECE_FRAC * total):
                 out = None
                 break
@@ -728,9 +740,19 @@ def _extract(full, part, inv_scale, bg, tol, inset_full):
     if rx1 - rx0 < 100 or ry1 - ry0 < 100:
         return None
     box = (rx0, ry0, rx1, ry1)
-    if abs(a) < 1e-4:
-        return full.crop(box)
-    return full.rotate(math.degrees(a), resample=Image.BICUBIC, center=(cx, cy)).crop(box)
+    # Mask everything outside the photo quad to white so neighbouring photos /
+    # background caught by the axis-aligned bbox of a deskewed (rotated) crop
+    # never bleed into the output.
+    qm = Image.new("L", full.size, 0)
+    qd = ImageDraw.Draw(qm)
+    qd.polygon([(float(p[0]), float(p[1])) for p in q], fill=255)
+    if abs(a) >= 1e-4:
+        qm = qm.rotate(math.degrees(a), resample=Image.NEAREST, center=(cx, cy))
+    qm = qm.crop(box)
+    out = full.crop(box) if abs(a) < 1e-4 else \
+        full.rotate(math.degrees(a), resample=Image.BICUBIC, center=(cx, cy)).crop(box)
+    white = Image.new("RGB", out.size, (255, 255, 255))
+    return Image.composite(out, white, qm)
 
 
 def _auto_upright(img):
@@ -782,10 +804,74 @@ def analyze_scan(path, tol=16.0, maxdim=3200, inset_full=4.0):
             "tol": tol, "inset_full": inset_full, "mask": mask}
 
 
-def extract_parts(st, mask=None, rotate=False):
+def _piece_ok(qm, page_area):
+    """Pre-extract sanity gate for a candidate piece mask (B1)."""
+    ys, xs = np.nonzero(qm)
+    if len(ys) == 0:
+        return False
+    bh = int(ys.max()) - int(ys.min()) + 1
+    bw = int(xs.max()) - int(xs.min()) + 1
+    ar = max(bh, bw) / max(1.0, min(bh, bw))
+    fill = float(qm.sum()) / float(bh * bw)
+    if ar > _MAX_PIECE_AR:
+        return False
+    if qm.sum() < max(400.0, _MIN_PIECE_FRAC * page_area):
+        return False
+    # low fill usually means a still-butted multi-photo composite; allow the
+    # exotic large-butted case only for page-dominating components where the
+    # seam split already tried its best (B1 keeps smaller low-fill shards out)
+    if fill < 0.55 and qm.sum() < 0.5 * page_area:
+        return False
+    return True
+
+
+def _dedupe_parts(parts, page_area, frac=0.5):
+    """Drop pieces whose mask is mostly covered by already-kept pieces (A3).
+
+    Sorts by area descending; a piece is a duplicate when > frac of its own
+    mask overlaps the union of kept pieces. Guarantees every kept piece
+    contributes mostly-unique pixels — no photo is emitted twice.
+    """
+    kept = []
+    kept_union = None
+    for qm, qx, qy in sorted(parts, key=lambda p: -float(p[0].sum())):
+        ys, xs = np.nonzero(qm)
+        if len(ys) == 0:
+            continue
+        cand = np.zeros((int(ys.max() - ys.min()) + 1, int(xs.max() - xs.min()) + 1), bool)
+        cand[ys - ys.min(), xs - xs.min()] = True
+        overlap = 0
+        if kept_union is not None:
+            ox0 = max(qx, kept_union[1])
+            oy0 = max(qy, kept_union[2])
+            ox1 = min(qx + cand.shape[1], kept_union[1] + kept_union[0].shape[1])
+            oy1 = min(qy + cand.shape[0], kept_union[2] + kept_union[0].shape[0])
+            if ox1 > ox0 and oy1 > oy0:
+                ov = kept_union[0][oy0 - kept_union[2]:oy1 - kept_union[2],
+                                   ox0 - kept_union[1]:ox1 - kept_union[1]]
+                cc = cand[oy0 - qy:oy1 - qy, ox0 - qx:ox1 - qx]
+                overlap = int((ov & cc).sum())
+        if overlap > frac * float(qm.sum()):
+            continue
+        kept.append((qm, qx, qy))
+        if kept_union is None:
+            kept_union = [cand.copy(), qx, qy]
+        else:
+            # widen union canvas
+            ux0, uy0 = min(qx, kept_union[1]), min(qy, kept_union[2])
+            ux1 = max(qx + cand.shape[1], kept_union[1] + kept_union[0].shape[1])
+            uy1 = max(qy + cand.shape[0], kept_union[2] + kept_union[0].shape[0])
+            nu = np.zeros((uy1 - uy0, ux1 - ux0), bool)
+            nu[kept_union[2] - uy0:kept_union[2] - uy0 + kept_union[0].shape[0],
+               kept_union[1] - ux0:kept_union[1] - ux0 + kept_union[0].shape[1]] |= kept_union[0]
+            nu[qy - uy0:qy - uy0 + cand.shape[0], qx - ux0:qx - ux0 + cand.shape[1]] |= cand
+            kept_union = [nu, ux0, uy0]
+    return kept
+
+
+def _extract_core(st, mask, rotate):
+    """Component split + watershed + seam split + extraction for one mask."""
     im = st["im"]
-    if mask is None:
-        mask = st["mask"]
     lab = _label(mask)
     min_area = 0.003 * mask.size
     comps = []
@@ -803,7 +889,7 @@ def extract_parts(st, mask=None, rotate=False):
         comps.append((cm, x0, y0, area))
     parts = []
     page_area = float(mask.size)
-    med = float(np.median([c[3] for c in comps])) if comps else 0.0
+    med = float(np.median([c[3] for c in comps]) if comps else 0.0)
     arr = np.asarray(st["small"], np.float32)
     lum = arr @ np.array([0.299, 0.587, 0.114], np.float32)
     for cm, x0, y0, area in comps:
@@ -814,12 +900,49 @@ def extract_parts(st, mask=None, rotate=False):
             for qm, qx, qy in _seam_split(pm, px, py, lum, page_area):
                 if qm.sum() >= min_area * 0.5:
                     parts.append((qm, qx, qy))
+    parts = _dedupe_parts([p for p in parts if _piece_ok(p[0], page_area)], page_area)
     inv = 1.0 / st["scale"]
     out = []
     for part in parts:
         img = _extract(im, part, inv, st["bg"], st["tol"], st["inset_full"])
-        if img is not None:
-            out.append(_auto_upright(img) if rotate else img)
+        if img is None:
+            continue
+        if _mostly_blank(img):
+            continue
+        out.append(_auto_upright(img) if rotate else img)
+    return out, parts
+
+
+def _mostly_blank(img, frac=0.95):
+    """B2: drop extractions that are ~all background/white."""
+    t = img.convert("RGB")
+    t.thumbnail((200, 200))
+    a = np.asarray(t, np.float32)
+    # near-white OR near-gray-uniform background: count pixels close to white
+    white = (a > 235).all(axis=2)
+    return float(white.mean()) > frac
+
+
+def extract_parts(st, mask=None, rotate=False):
+    if mask is None:
+        mask = st["mask"]
+    out, parts = _extract_core(st, mask, rotate)
+    # B3: coverage check + one bounded retry. Coverage = kept-piece mask area
+    # vs total photo-area in the original mask. If a big chunk was dropped or
+    # left merged, retry with a lower tolerance (rescues white-on-white photos
+    # whose mask collapses at the user tolerance) and keep the better result.
+    page_area = float(mask.size)
+    cov = sum(float(p[0].sum()) for p in parts) / page_area if parts else 0.0
+    if cov < 0.75 and mask is st["mask"] and st["tol"] > 10.0:
+        try:
+            st2 = analyze_scan(st["path"], tol=max(10.0, st["tol"] - 4.0),
+                               maxdim=3200, inset_full=st["inset_full"])
+            out2, parts2 = _extract_core(st2, st2["mask"], rotate)
+            cov2 = sum(float(p[0].sum()) for p in parts2) / page_area if parts2 else 0.0
+            if cov2 > cov and len(out2) > len(out):
+                out = out2
+        except Exception:
+            pass
     return out
 
 
@@ -1274,7 +1397,7 @@ def mask_editor(parent, st):
 
     def ok():
         if not mask.any():
-            messagebox.showwarning("PhotoSplit", "The mask is empty. Paint or add a rectangle first, "
+            messagebox.showwarning(APP_NAME, "The mask is empty. Paint or add a rectangle first, "
                                                  "or use Skip to leave this scan unsplit.", parent=top)
             return
         res["action"] = "ok"
@@ -1359,7 +1482,7 @@ def run_gui():
               "  Or use the command line:  python photosplit.py <files-or-folder>")
         return 1
     root = tk.Tk()
-    root.title("PhotoSplit")
+    root.title("%s v%s" % (APP_NAME, APP_VERSION))
     root.minsize(560, 480)
 
     files = []
@@ -1533,7 +1656,7 @@ def run_gui():
 
     def go():
         if not files:
-            messagebox.showinfo("PhotoSplit", "Add some images first.")
+            messagebox.showinfo(APP_NAME, "Add some images first.")
             return
         fmtmap = {"PNG (lossless)": ("png", None), "JPEG (quality 95)": ("jpeg", 95),
                   "JPEG (quality 88)": ("jpeg", 88)}
@@ -1595,14 +1718,14 @@ def run_gui():
                     set_busy(False)
                     if outdir:
                         b_open.configure(state="normal")
-                    root.title("PhotoSplit - %d photos" % total)
+                    root.title("%s v%s - %d photos" % (APP_NAME, APP_VERSION, total))
         except queue.Empty:
             pass
         root.after(120, poll)
 
     def on_close():
         if busy[0]:
-            if not messagebox.askyesno("PhotoSplit", "A batch is running. Abort and quit?"):
+            if not messagebox.askyesno(APP_NAME, "A batch is running. Abort and quit?"):
                 return
             abort.set()
             if review["st"] is not None:
