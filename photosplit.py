@@ -17,7 +17,7 @@ Image.MAX_IMAGE_PIXELS = None
 EXTS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".webp"}
 
 APP_NAME = "photo-scan-auto-splitter"
-APP_VERSION = "1.6.0"
+APP_VERSION = "1.7.0"
 
 
 def _runs(b):
@@ -321,7 +321,23 @@ def _watershed(m, ox, oy):
     parts = _geodesic_parts(mf, seeds)
     if not parts:
         parts = _voronoi_parts(mf, seeds)
-    return [((pm & m), ox, oy) for pm, _, _ in parts]
+    out = []
+    for pm, _, _ in parts:
+        pm = pm & m
+        ys, xs = np.nonzero(pm)
+        if len(ys) == 0:
+            return []
+        bh = int(ys.max()) - int(ys.min()) + 1
+        bw = int(xs.max()) - int(xs.min()) + 1
+        # A ragged (low bbox-fill) part is a geodesic leak: the seed regions
+        # interpenetrate instead of following real photo borders. Such a split
+        # destroys blobs that _seam_split could cut cleanly (e.g. a dark
+        # photobooth strip butted on top of two prints), so reject the whole
+        # watershed result and let the seam machinery handle the component.
+        if float(pm.sum()) / float(bh * bw) < 0.45:
+            return []
+        out.append((pm, ox, oy))
+    return out
 
 
 _SEAM_SPAN_FRAC = 0.10
@@ -459,7 +475,43 @@ def _crop_subs(m, ox, oy, page_area):
     return res
 
 
-def _band_like(pa, pb, lc, axis):
+def _frame_blobs(pa, cc, min_frac=0.06):
+    """Count solid photo-frame blobs inside a band candidate.
+
+    A real multi-frame strip (e.g. a dark maroon photobooth strip) carries
+    several large solid rectangles whose color differs strongly from the band's
+    own dominant color; a text/design band is flat except thin low-fill
+    strokes. Uses color distance from the band median (luminance gradient
+    fails on dark frames over a dark band)."""
+    if pa.sum() < 3000:
+        return 0
+    med = np.median(cc[pa], axis=0)
+    d = np.sqrt(((cc - med) ** 2).sum(axis=2))
+    cont = pa & (d > 50.0)
+    if cont.sum() < 0.08 * float(pa.sum()):
+        return 0
+    ci = Image.fromarray(cont.astype(np.uint8) * 255)
+    ci = ci.filter(ImageFilter.MinFilter(3)).filter(ImageFilter.MaxFilter(15))
+    cl = np.asarray(ci) > 127
+    cl &= pa
+    lab = _label(cl)
+    tot = float(pa.sum())
+    n = 0
+    for l in np.unique(lab):
+        if l == 0:
+            continue
+        ys, xs = np.nonzero(lab == l)
+        if xs.size < min_frac * tot:
+            continue
+        bh = int(ys.max()) - int(ys.min()) + 1
+        bw = int(xs.max()) - int(xs.min()) + 1
+        if xs.size < 0.5 * bh * bw:
+            continue
+        n += 1
+    return n
+
+
+def _band_like(pa, pb, lc, axis, cc=None):
     if pa.sum() < 3000:
         return False
     if axis == 0:
@@ -470,7 +522,11 @@ def _band_like(pa, pb, lc, axis):
         eb = int(pb.any(axis=0).sum())
     if ea >= 0.85 * eb:
         return False
-    return float(np.median(lc[pa])) < 0.62 * float(np.median(lc[pb]))
+    if float(np.median(lc[pa])) >= 0.62 * float(np.median(lc[pb])):
+        return False
+    if cc is not None and _frame_blobs(pa, cc) >= 2:
+        return False
+    return True
 
 
 def _seg_dist(p, a, b):
@@ -570,7 +626,7 @@ def _ext_corners(m, maxside=720.0):
     return n
 
 
-def _seam_split(m, ox, oy, lum, page_area, depth=0):
+def _seam_split(m, ox, oy, lum, page_area, depth=0, rgb=None):
     total = float(m.sum())
     h, w = m.shape
     if depth >= 5 or total < 4000.0 or h < 60 or w < 60:
@@ -584,6 +640,7 @@ def _seam_split(m, ox, oy, lum, page_area, depth=0):
     if elong < 2.2 and total < 0.25 * page_area:
         return [(m, ox, oy)]
     lc = lum[oy:oy + h, ox:ox + w]
+    rc = None if rgb is None else rgb[oy:oy + h, ox:ox + w]
     for axis in (0, 1):
         mm = m if axis == 0 else m.T
         ll = lc if axis == 0 else lc.T
@@ -602,8 +659,8 @@ def _seam_split(m, ox, oy, lum, page_area, depth=0):
             pb = m & (cc >= cut[:, None])
         sa, sb = float(pa.sum()), float(pb.sum())
         need = max(0.15 * total, 400.0)
-        ba = _band_like(pa, pb, lc, axis)
-        bb = _band_like(pb, pa, lc, axis)
+        ba = _band_like(pa, pb, lc, axis, rc)
+        bb = _band_like(pb, pa, lc, axis, rc)
         if min(sa, sb) < need:
             ok = (sa < sb and ba and sb >= need) or (sb < sa and bb and sa >= need)
             if not ok:
@@ -630,7 +687,7 @@ def _seam_split(m, ox, oy, lum, page_area, depth=0):
                     # the pre-extract sanity gate drops composites that refuse to
                     # sub-split.
                     if nc <= 14 and ar <= _MAX_PIECE_AR:
-                        out += _seam_split(cs[0], cs[1], cs[2], lum, page_area, depth + 1)
+                        out += _seam_split(cs[0], cs[1], cs[2], lum, page_area, depth + 1, rgb)
                         continue
                     out = None
                     break
@@ -644,7 +701,7 @@ def _seam_split(m, ox, oy, lum, page_area, depth=0):
             continue
         parts = []
         for cm, cx, cy in out:
-            parts += _seam_split(cm, cx, cy, lum, page_area, depth + 1)
+            parts += _seam_split(cm, cx, cy, lum, page_area, depth + 1, rgb)
         return parts or [(m, ox, oy)]
     return [(m, ox, oy)]
 
@@ -952,7 +1009,7 @@ def _extract_core(st, mask, rotate):
         if len(subs) == 1 and area >= 0.04 * page_area and area > 1.15 * med:
             subs = _watershed(*subs[0]) or subs
         for pm, px, py in subs:
-            for qm, qx, qy in _seam_split(pm, px, py, lum, page_area):
+            for qm, qx, qy in _seam_split(pm, px, py, lum, page_area, rgb=arr):
                 if qm.sum() >= min_area * 0.5:
                     parts.append((qm, qx, qy))
     parts = _dedupe_parts([p for p in parts if _piece_ok(p[0], page_area)], page_area)
