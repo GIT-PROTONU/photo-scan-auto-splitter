@@ -17,7 +17,7 @@ Image.MAX_IMAGE_PIXELS = None
 EXTS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".webp"}
 
 APP_NAME = "photo-scan-auto-splitter"
-APP_VERSION = "1.7.0"
+APP_VERSION = "1.8.0"
 
 
 def _runs(b):
@@ -626,6 +626,40 @@ def _ext_corners(m, maxside=720.0):
     return n
 
 
+def _clean_quad_side(m):
+    ys, xs = np.nonzero(m)
+    if len(ys) < 50:
+        return False
+    bh = int(ys.max()) - int(ys.min()) + 1
+    bw = int(xs.max()) - int(xs.min()) + 1
+    area = float(m.sum())
+    fill = area / float(bh * bw)
+    if fill < 0.92:
+        return False
+    nc = _ext_corners(m)
+    if not 4 <= nc <= 8:
+        return False
+    ar = max(bh, bw) / max(1.0, min(bh, bw))
+    return ar < 2.2
+
+
+def _wedge_side(m, total):
+    ys, xs = np.nonzero(m)
+    if len(ys) == 0:
+        return False
+    bh = int(ys.max()) - int(ys.min()) + 1
+    bw = int(xs.max()) - int(xs.min()) + 1
+    area = float(m.sum())
+    if area >= 0.25 * total or area < 0.12 * total:
+        return False
+    fill = area / float(bh * bw)
+    if fill >= 0.80:
+        return False
+    nc = _ext_corners(m)
+    ar = max(bh, bw) / max(1.0, min(bh, bw))
+    return nc < 4 or nc > 10 or ar >= 2.0
+
+
 def _seam_split(m, ox, oy, lum, page_area, depth=0, rgb=None):
     total = float(m.sum())
     h, w = m.shape
@@ -661,16 +695,25 @@ def _seam_split(m, ox, oy, lum, page_area, depth=0, rgb=None):
         need = max(0.15 * total, 400.0)
         ba = _band_like(pa, pb, lc, axis, rc)
         bb = _band_like(pb, pa, lc, axis, rc)
+        only_big = False
         if min(sa, sb) < need:
             ok = (sa < sb and ba and sb >= need) or (sb < sa and bb and sa >= need)
             if not ok:
-                continue
-        if ba and not bb and sb > sa:
-            sides = ((pb, ox, oy),)
-        elif bb and not ba and sa > sb:
-            sides = ((pa, ox, oy),)
-        else:
-            sides = ((pa, ox, oy), (pb, ox, oy))
+                if sa > sb and sa >= need and _clean_quad_side(pa) and _wedge_side(pb, total):
+                    sides = ((pa, ox, oy),)
+                    only_big = True
+                elif sb > sa and sb >= need and _clean_quad_side(pb) and _wedge_side(pa, total):
+                    sides = ((pb, ox, oy),)
+                    only_big = True
+                else:
+                    continue
+        if not only_big:
+            if ba and not bb and sb > sa:
+                sides = ((pb, ox, oy),)
+            elif bb and not ba and sa > sb:
+                sides = ((pa, ox, oy),)
+            else:
+                sides = ((pa, ox, oy), (pb, ox, oy))
         out = []
         for pm, px, py in sides:
             cs_list = _crop_subs(pm, px, py, page_area)
@@ -776,6 +819,103 @@ def _refine(pts, q, inset):
     return q
 
 
+def _desliver_side(mm, margin, rng):
+    """Remove foreign wedges protruding beyond the dominant edge line.
+
+    mm is oriented so the edge under test is the TOP. A butt-jointed neighbour
+    whose straight edge crosses the (near-horizontal) seam cut leaves a
+    triangular sliver attached to this piece; the quad fit then spans
+    sliver-to-photo and the output carries an angled white band. RANSAC the
+    dominant straight line through the per-column top profile and delete mask
+    pixels above it. No-ops unless the line covers >=40% of columns and the
+    removal is <=15% of area, so clean/tilted rectangles and ragged pieces are
+    untouched."""
+    h, w = mm.shape
+    prof = np.full(w, -1, np.int64)
+    for x in range(w):
+        col = np.flatnonzero(mm[:, x])
+        if col.size:
+            prof[x] = col[0]
+    valid = np.flatnonzero(prof >= 0)
+    if valid.size < max(80, 0.5 * w):
+        return mm
+    vx = valid.astype(np.float64)
+    vy = prof[valid].astype(np.float64)
+    if vy.max() - vy.min() <= margin:
+        return mm
+    n = valid.size
+    best_cnt, best_ab = -1, None
+    for _ in range(300):
+        i, j = rng.integers(n, size=2)
+        if i == j:
+            continue
+        b = (vy[j] - vy[i]) / (vx[j] - vx[i]) if vx[j] != vx[i] else 0.0
+        if abs(b) > 0.2:
+            continue
+        a = vy[i] - b * vx[i]
+        cnt = int((np.abs(vy - (a + b * vx)) <= 4.0).sum())
+        if cnt > best_cnt:
+            best_cnt, best_ab = cnt, (a, b)
+    if best_cnt < 0.4 * n:
+        return mm
+    a, b = best_ab
+    for _ in range(2):
+        inl = np.abs(vy - (a + b * vx)) <= 4.0
+        if int(inl.sum()) < 40:
+            return mm
+        A = np.stack([np.ones(int(inl.sum())), vx[inl]], 1)
+        sol, *_ = np.linalg.lstsq(A, vy[inl], rcond=None)
+        a, b = float(sol[0]), float(sol[1])
+    out = mm.copy()
+    removed = 0
+    for x in valid:
+        cut = int(math.ceil(a + b * x))
+        if prof[x] < cut - margin:
+            out[prof[x]:cut - 1, x] = False
+            removed += cut - 1 - prof[x]
+    if removed > 0.15 * float(mm.sum()):
+        return mm
+    return out
+
+
+def _desliver(m):
+    rng = np.random.default_rng(12345)
+    out = m.copy()
+    for i in range(4):
+        margin = max(3, int(round(0.006 * max(out.shape))))
+        if i == 1:
+            a = np.ascontiguousarray(out[::-1, :])
+        elif i == 2:
+            a = np.ascontiguousarray(out.T)
+        elif i == 3:
+            a = np.ascontiguousarray(out[::-1, :].T)
+        else:
+            a = out
+        b = _desliver_side(a, margin, rng)
+        if i == 1:
+            out = np.ascontiguousarray(b[::-1, :])
+        elif i == 2:
+            out = np.ascontiguousarray(b.T)
+        elif i == 3:
+            out = np.ascontiguousarray(b.T[::-1, :])
+        else:
+            out = b
+    return out
+
+
+def _quad_side_diff(q):
+    def L(a, b):
+        return math.hypot(a[0] - b[0], a[1] - b[1])
+    tl, tr, br, bl = q
+    left = L(tl, bl)
+    right = L(tr, br)
+    top = L(tl, tr)
+    bot = L(bl, br)
+    lr = abs(left - right) / max(left, right, 1.0)
+    tb = abs(top - bot) / max(top, bot, 1.0)
+    return lr, tb
+
+
 def _axis_crop(full, up, wsc, fx0, fy0, fx1, fy1, pts):
     """Group-5 fallback: a piece whose fitted quad angle was rejected as a
     silhouette artifact is cropped as a plain axis-aligned rectangle of its own
@@ -814,7 +954,18 @@ def _extract(full, part, inv_scale, bg, tol, inset_full):
         ww, wh = crop.size
         work = crop
     sub = m[ys.min():ys.max() + 1, xs.min():xs.max() + 1]
+    lab_s = _label(sub)
+    keep = np.zeros_like(sub)
+    for l in np.unique(lab_s):
+        if l == 0:
+            continue
+        cc = lab_s == l
+        if cc.sum() >= 2000:
+            keep |= cc
+    if keep.any():
+        sub = keep
     up = np.asarray(Image.fromarray(sub.astype(np.uint8) * 255).resize((ww, wh), Image.BILINEAR)) > 100
+    up = _desliver(up)
     arr = np.asarray(work, np.float32)
     dist = np.sqrt(((arr - bg) ** 2).sum(axis=2))
     fmask = (dist > tol) & up
@@ -832,6 +983,10 @@ def _extract(full, part, inv_scale, bg, tol, inset_full):
     # angle (undoes placement rotation) and crop an axis-aligned rectangle.
     a = math.atan2(q[1][1] - q[0][1], q[1][0] - q[0][0])
     if abs(math.degrees(a)) > _MAX_DESKEW_DEG:
+        return _axis_crop(full, up, wsc, fx0, fy0, fx1, fy1, pts)
+    tight_fill = float(m.sum()) / float(max(1, (int(xs.max()) - int(xs.min()) + 1) * (int(ys.max()) - int(ys.min()) + 1)))
+    lr, _tb = _quad_side_diff(q)
+    if lr > 0.13 and tight_fill < 0.80:
         return _axis_crop(full, up, wsc, fx0, fy0, fx1, fy1, pts)
     ca, sa = math.cos(a), math.sin(a)
     cx = float(q[:, 0].mean())
