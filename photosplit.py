@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 import argparse
+import hashlib
+import json
 import math
 import os
 import queue
+import re
 import shutil
 import subprocess
 import sys
 import threading
+from concurrent.futures import ProcessPoolExecutor
 
 import numpy as np
 from numpy.lib.stride_tricks import sliding_window_view
@@ -17,7 +21,7 @@ Image.MAX_IMAGE_PIXELS = None
 EXTS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".webp"}
 
 APP_NAME = "photo-scan-auto-splitter"
-APP_VERSION = "1.8.1"
+APP_VERSION = "1.8.2"
 
 
 def _runs(b):
@@ -1184,6 +1188,7 @@ def _extract_core(st, mask, rotate):
             continue
         if _mostly_blank(img):
             continue
+        img = _border_trim(img)
         out.append(_auto_upright(img) if rotate else img)
     return out, parts
 
@@ -1244,6 +1249,186 @@ def process_state(st, mask, outdir, fmt, quality, rotate):
 def process_file(path, outdir, fmt, quality, tol, rotate):
     st = analyze_scan(path, tol=tol)
     return process_state(st, st["mask"], outdir, fmt, quality, rotate)
+
+
+_BT_MIN = 0.02
+_BT_MAX = 0.35
+_BT_BAND_MIN = 12
+_BT_BAND_FRAC = 0.08
+_BT_BAND_MEAN = 226.0
+_BT_BAND_STD = 9.0
+_BT_BAND_COVER = 0.85
+_BT_STRIP_WHITE = 0.15
+_BT_STRIP_MEAN = 215.0
+_BT_LINE_GRAD = 12.0
+_BT_LINE_COVER = 0.85
+
+
+def _bt_side(a):
+    """Trim depth for one side of a luminance array laid out so rows run
+    inward from the piece edge, or None. Signature of a neighbor-photo bleed:
+    [foreign content][photo's own flat white border band][photo content].
+    A real photo never has content beyond its outer border, so the piece must
+    start AT the border: strip rows must be non-white content, the band must
+    be a full-width, near-zero-variance white run entered by a strong line,
+    and content must resume after the band."""
+    h = a.shape[0]
+    white = a > 220.0
+    wmask = white.mean(1)
+    bmean = a.mean(1)
+    bstd = a.std(1)
+    lo, hi = int(_BT_MIN * h), int(_BT_MAX * h)
+    for p in range(lo, hi):
+        if wmask[p] < _BT_BAND_COVER or bmean[p] < _BT_BAND_MEAN or bstd[p] > _BT_BAND_STD:
+            continue
+        q = p
+        while (q < h and wmask[q] >= _BT_BAND_COVER and bmean[q] >= _BT_BAND_MEAN
+               and bstd[q] <= _BT_BAND_STD):
+            q += 1
+        fb = q - p
+        if fb < _BT_BAND_MIN or fb > _BT_BAND_FRAC * h:
+            continue
+        strip = a[:p]
+        if float(white[:p].mean()) > _BT_STRIP_WHITE or float(strip.mean()) > _BT_STRIP_MEAN:
+            continue
+        ok_content = False
+        for r in range(q, min(h - 20, q + int(0.25 * h)), 4):
+            if float(white[r:r + 20].mean()) <= 0.45:
+                ok_content = True
+                break
+        if not ok_content:
+            continue
+        d = a[p + 1:p + 6].mean(0) - a[max(0, p - 5):p - 1].mean(0) if p >= 6 else None
+        if d is None or float(d.mean()) < _BT_LINE_GRAD or float((d >= 6.0).mean()) < _BT_LINE_COVER:
+            continue
+        return p
+    return None
+
+
+def _border_trim(img):
+    """Group-2 post-cut validator: drop neighbor-photo bleed strips from the
+    final extracted piece using the full-res white-border landmark (mask-side
+    geometry cannot see these strips — see AGENTS.md dead-end notes)."""
+    a = np.asarray(img.convert("L"), np.float32)
+    H, W = a.shape
+    if H < 400 or W < 400:
+        return img
+    box = [0, 0, W, H]
+    for _ in range(2):
+        moved = False
+        for side, arr in (("t", a), ("b", a[::-1]), ("l", a.T), ("r", a.T[:, ::-1])):
+            p = _bt_side(np.ascontiguousarray(arr))
+            if p is None:
+                continue
+            if side == "t":
+                box[1] += p
+            elif side == "b":
+                box[3] -= p
+            elif side == "l":
+                box[0] += p
+            else:
+                box[2] -= p
+            hh, ww = a.shape
+            if side == "t":
+                a = a[p:hh]
+            elif side == "b":
+                a = a[:hh - p]
+            elif side == "l":
+                a = a[:, p:ww]
+            else:
+                a = a[:, :ww - p]
+            moved = True
+        if not moved:
+            break
+    if box == [0, 0, W, H]:
+        return img
+    if box[2] - box[0] < 200 or box[3] - box[1] < 200:
+        return img
+    return img.crop(tuple(box))
+
+
+def _reg_sig(path, tol):
+    st = analyze_scan(path, tol=tol)
+    out, parts = _extract_core(st, st["mask"], False)
+    boxes = []
+    for m, ox, oy in parts:
+        ys, xs = np.nonzero(m)
+        boxes.append([int(xs.min()) + ox, int(ys.min()) + oy,
+                      int(xs.max()) + ox, int(ys.max()) + oy, int(m.sum())])
+    boxes.sort()
+    thumbs = []
+    for img in out:
+        t = img.copy()
+        t.thumbnail((96, 96))
+        thumbs.append(hashlib.md5(np.asarray(t).tobytes()).hexdigest()[:12])
+    return {"n_parts": len(boxes), "boxes": boxes, "n_imgs": len(out),
+            "thumbs": sorted(thumbs)}
+
+
+def _reg_job(args):
+    path, tol = args
+    try:
+        return args, _reg_sig(path, tol)
+    except Exception as e:
+        return args, {"error": repr(e)}
+
+
+_OUT_RE = re.compile(r"_\d{1,2}\.(jpg|jpeg|png|tif|tiff|bmp|webp)$", re.I)
+
+
+def run_regression(dirs, sig, compare):
+    """Hidden dev mode: snapshot piece bboxes + output thumbnail hashes for
+    every scan under DIRS at tol 16 and 20 (the gate-tuning regression set from
+    AGENTS.md). Writes --sig; with --compare prints every signature difference
+    and exits 1 if anything moved."""
+    files = []
+    for d in dirs:
+        d = os.path.abspath(d)
+        for root, _, fs in os.walk(d):
+            for f in sorted(fs):
+                if os.path.splitext(f)[1].lower() not in EXTS or _OUT_RE.search(f):
+                    continue
+                files.append(os.path.join(root, f))
+    keys = {}
+    for d in dirs:
+        ad = os.path.abspath(d)
+        tag = os.path.basename(ad)
+        for p in files:
+            if p.startswith(ad + os.sep):
+                keys[p] = "%s/%s" % (tag, os.path.relpath(p, ad))
+    jobs = [(p, tol) for p in files for tol in (16.0, 20.0)]
+    res = {}
+    if jobs:
+        with ProcessPoolExecutor(max_workers=min(8, os.cpu_count() or 4)) as ex:
+            for (path, tol), v in ex.map(_reg_job, jobs):
+                print("done %s @%d" % (os.path.basename(path), tol), file=sys.stderr)
+                res["%s@%d" % (keys[path], tol)] = v
+    if sig:
+        with open(sig, "w") as f:
+            json.dump(res, f, indent=1, sort_keys=True)
+        print("wrote %s (%d runs)" % (sig, len(res)))
+    if compare:
+        with open(compare) as f:
+            ref = json.load(f)
+        bad = 0
+        for k in sorted(set(ref) | set(res)):
+            if ref.get(k) != res.get(k):
+                bad += 1
+                print("DIFF %s" % k)
+                a, b = ref.get(k) or {}, res.get(k) or {}
+                if a.get("boxes") != b.get("boxes"):
+                    sa, sb = set(map(tuple, a.get("boxes", []))), set(map(tuple, b.get("boxes", [])))
+                    for x in sorted(sa - sb):
+                        print("   -", list(x))
+                    for x in sorted(sb - sa):
+                        print("   +", list(x))
+                if a.get("thumbs") != b.get("thumbs"):
+                    print("   thumbs %s -> %s (n_imgs %s -> %s)"
+                          % (len(a.get("thumbs", [])), len(b.get("thumbs", [])),
+                             a.get("n_imgs"), b.get("n_imgs")))
+        print("regression: %d/%d runs differ" % (bad, len(set(ref) | set(res))))
+        return 1 if bad else 0
+    return 0
 
 
 def open_folder(path):
@@ -2031,7 +2216,12 @@ def main():
     ap.add_argument("--tolerance", type=float, default=16.0,
                     help="background color tolerance, higher = more aggressive (default 16)")
     ap.add_argument("--rotate", action="store_true", help="try to auto-rotate sideways photos (experimental)")
+    ap.add_argument("--regression", nargs="+", metavar="DIR", help=argparse.SUPPRESS)
+    ap.add_argument("--sig", metavar="FILE", help=argparse.SUPPRESS)
+    ap.add_argument("--compare", metavar="FILE", help=argparse.SUPPRESS)
     a = ap.parse_args()
+    if a.regression:
+        sys.exit(run_regression(a.regression, a.sig, a.compare))
     if a.inputs:
         sys.exit(run_cli(a))
     sys.exit(run_gui())

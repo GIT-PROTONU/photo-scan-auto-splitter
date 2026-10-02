@@ -11,7 +11,7 @@ people digitizing old photo albums, binder pages, or scanner beds with multiple 
 ## Download
 
 Grab the ready-to-run Windows executable from the
-[**v1.8.1 release page**](https://github.com/GIT-PROTONU/photo-scan-auto-splitter/releases/tag/v1.8.1):
+[**v1.8.2 release page**](https://github.com/GIT-PROTONU/photo-scan-auto-splitter/releases/tag/v1.8.2):
 
 - `PhotoSplit.exe` — fully self-contained (Windows 10+, 64-bit).
   No Python, no installation: download, double-click, done.

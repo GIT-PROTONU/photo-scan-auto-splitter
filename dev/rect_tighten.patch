@@ -1,0 +1,91 @@
+diff --git a/photosplit.py b/photosplit.py
+index db56224..45ec167 100644
+--- a/photosplit.py
++++ b/photosplit.py
+@@ -668,6 +668,78 @@ def _wedge_side(m, total):
+     return nc < 4 or nc > 10 or ar >= 2.0
+ 
+ 
++_TIGHTEN_OCC = 0.55
++_TIGHTEN_TAIL_FRAC = 0.13
++_TIGHTEN_MAX_TRIM = 0.15
++_TIGHTEN_CORE_FILL = 0.94
++
++
++def _rect_tighten(part):
++    """Blob-fits-rectangle validator for watershed parts. Watershed boundaries
++    overshoot into the neighbour in white-on-white contact zones (Group-2 bleed:
++    Scans 19, 25-4 — the guests piece carries a strip of the couple photo), and
++    no luminance seam exists there, so the seam machinery can never locate the
++    true border. A real photo's blob fits a rectangle: trim thin low-occupancy
++    tails that stick out of one side of the dominant rectangle, but only if the
++    kept core is photo-like (high bbox fill, 4-8 external corners). Every gate
++    is non-destructive — if anything fails, the part is returned untouched."""
++    m, ox, oy = part
++    ys, xs = np.nonzero(m)
++    if len(ys) < 50:
++        return part
++    y0, y1 = int(ys.min()), int(ys.max())
++    x0, x1 = int(xs.min()), int(xs.max())
++    sub = m[y0:y1 + 1, x0:x1 + 1]
++    total = float(sub.sum())
++    trimmed = 0
++    top = left = 0
++    for _ in range(4):
++        h, w = sub.shape
++        if h < 60 or w < 60:
++            break
++        rows = sub.sum(1)
++        cols = sub.sum(0)
++        hit = False
++        for side, prof, thr, dim in (
++                ("t", rows, _TIGHTEN_OCC * float(rows.max()), h),
++                ("b", rows[::-1], _TIGHTEN_OCC * float(rows.max()), h),
++                ("l", cols, _TIGHTEN_OCC * float(cols.max()), w),
++                ("r", cols[::-1], _TIGHTEN_OCC * float(cols.max()), w)):
++            t = 0
++            for v in prof:
++                if float(v) < thr:
++                    t += 1
++                else:
++                    break
++            if t == 0 or t > _TIGHTEN_TAIL_FRAC * dim:
++                continue
++            cut = (sub[t:] if side == "t" else sub[:h - t] if side == "b" else
++                   sub[:, t:] if side == "l" else sub[:, :w - t])
++            area = float(cut.sum())
++            if total - area > _TIGHTEN_MAX_TRIM * total:
++                continue
++            if side == "t":
++                top += t
++            elif side == "l":
++                left += t
++            sub = np.ascontiguousarray(cut)
++            trimmed += int(total - area)
++            total = area
++            hit = True
++            break
++        if not hit:
++            break
++    if not trimmed:
++        return part
++    hh, ww = sub.shape
++    if float(sub.sum()) / float(max(1, hh * ww)) < _TIGHTEN_CORE_FILL:
++        return part
++    nc = _ext_corners(sub)
++    if not 4 <= nc <= 8:
++        return part
++    return (sub, ox + x0 + left, oy + y0 + top)
++
++
+ def _seam_split(m, ox, oy, lum, page_area, depth=0, rgb=None):
+     total = float(m.sum())
+     h, w = m.shape
+@@ -1173,6 +1245,7 @@ def _extract_core(st, mask, rotate):
+             subs = _watershed(*subs[0]) or subs
+         for pm, px, py in subs:
+             for qm, qx, qy in _seam_split(pm, px, py, lum, page_area, rgb=arr):
++                qm, qx, qy = _rect_tighten((qm, qx, qy))
+                 if qm.sum() >= min_area * 0.5:
+                     parts.append((qm, qx, qy))
+     parts = _dedupe_parts([p for p in parts if _piece_ok(p[0], page_area)], page_area)
