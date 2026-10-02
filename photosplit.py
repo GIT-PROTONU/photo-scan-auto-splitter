@@ -17,7 +17,7 @@ Image.MAX_IMAGE_PIXELS = None
 EXTS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".webp"}
 
 APP_NAME = "photo-scan-auto-splitter"
-APP_VERSION = "1.8.0"
+APP_VERSION = "1.8.1"
 
 
 def _runs(b):
@@ -337,6 +337,14 @@ def _watershed(m, ox, oy):
         if float(pm.sum()) / float(bh * bw) < 0.45:
             return []
         out.append((pm, ox, oy))
+    # Coverage gate: kept parts must tile most of the component. The
+    # area/overlap filters in _parts_from_assign can silently DELETE a whole
+    # photo (Scan_20260918 (6) tol 20: the tilted print's two fragments' bboxes
+    # overlap the neighbour's, so the neighbour is dropped and the print is
+    # halved). A real grid partition covers ~everything; a lossy split must
+    # fall through to _seam_split instead of eating pictures.
+    if sum(float(p[0].sum()) for p in out) < 0.8 * float(m.sum()):
+        return []
     return out
 
 
